@@ -1,5 +1,39 @@
 # legacy-proxy
 
+## This fork (`Wnt/legacy-proxy`)
+
+A fork for a self-hosted Bulwark + gateway webmail in front of Gandi. Bug fixes
+only. `main` is upstream
+[`99cb77b`](https://github.com/bulwarkmail/legacy-proxy/commit/99cb77ba74eeab1c6d4f2214679038c09ae4b42c)
+(the commit our deployment pinned) plus the commits below. Images:
+`ghcr.io/wnt/legacy-proxy`.
+
+Changes from upstream:
+
+- **Email/query, Email/get and Email/changes match the pushed state.** Before,
+  the IDLE worker announced new mail, but requests ran on a pooled IMAP
+  connection that was NOOPed only after 30 s idle. Servers such as Stalwart
+  announce new mail to a SELECTed session only on NOOP, so results could miss
+  a change the state already claimed. The worker also bumped the state
+  without a change-log entry, so `Email/changes` could answer `created: []`
+  with the newer state. Now:
+  - a pooled connection is NOOPed whenever the account's email or mailbox
+    state moved since it last synced;
+  - `queryState`, `Email/get` `state` and the SEARCH cache use the state the
+    connection's view includes;
+  - the IDLE worker records INBOX arrivals, expunges and flag changes as
+    created, destroyed and updated ids before it bumps `EmailDelivery`;
+  - any state bump without ids makes `*/changes` across it answer
+    `cannotCalculateChanges`.
+
+  Code: `src/imap/pool.ts`, `src/push/idle.ts`, `src/state/store.ts` and
+  `src/jmap/methods/email.ts`. Tests: `test/unit/idle-consistency.spec.ts`.
+- Three stale upstream unit-test expectations are updated, so CI can gate on
+  the suite.
+- CI: `.github/workflows/test.yml` runs the typecheck and the unit tests on
+  every push and pull request. The image workflow lower-cases the repository
+  name for GHCR.
+
 > Pre-1.0. The wire shapes, storage formats, and config keys can change without
 > notice. There is no third-party security audit. Run it for development,
 > testing, and self-hosted experiments.
