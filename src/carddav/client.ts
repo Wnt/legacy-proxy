@@ -137,7 +137,9 @@ export class CardDavClient {
   constructor(opts: CardDavOpts) {
     this.opts = opts;
     const proto = opts.secure ? "https" : "http";
-    this.origin = `${proto}://${opts.host}:${opts.port}`;
+    // Through URL, so the comparisons in resolve() see the same normal form
+    // (lower-case host, default port dropped) as the hrefs they check.
+    this.origin = new URL(`${proto}://${opts.host}:${opts.port}`).origin;
     this.authHeader = buildAuth(opts.creds);
     this.cacheKey = `${this.origin}|${opts.creds.username}|${opts.basePath ?? ""}|${opts.principalPath ?? ""}`;
   }
@@ -157,7 +159,8 @@ export class CardDavClient {
     const xml = await this.propfind(root, 0, [
       "DAV:current-user-principal",
     ]);
-    const principal = pickHref(xml, "current-user-principal") ?? root;
+    const found = pickHref(xml, "current-user-principal");
+    const principal = found === null ? root : this.serverPath(found);
     this.rememberDiscovery({ principal });
     return principal;
   }
@@ -171,7 +174,8 @@ export class CardDavClient {
     const homeXml = await this.propfind(principal, 0, [
       "urn:ietf:params:xml:ns:carddav addressbook-home-set",
     ]);
-    const found = pickHref(homeXml, "addressbook-home-set") ?? principal;
+    const picked = pickHref(homeXml, "addressbook-home-set");
+    const found = picked === null ? principal : this.serverPath(picked);
     const home = found.endsWith("/") ? found : found + "/";
     this.rememberDiscovery({ home });
     return home;
@@ -210,6 +214,12 @@ export class CardDavClient {
       if (!hasResourceType(r, "addressbook")) continue;
       const href = extractHref(r);
       if (!href) continue;
+      // Every later request for this book carries the credentials, so only
+      // accept collections on the configured server, inside the home set.
+      if (!this.isWithin(home, href, "descendant-or-self")) {
+        log.warn({ href }, "carddav: ignoring an address book outside the home set");
+        continue;
+      }
       books.push({
         href,
         displayName: textOf(r, "displayname") ?? leafName(href),
@@ -233,7 +243,7 @@ export class CardDavClient {
     for (const r of responses) {
       if (hasResourceType(r, "collection")) continue; // skip the book itself
       const href = extractHref(r);
-      if (!href) continue;
+      if (!href || !this.isMember(bookHref, href)) continue;
       out.push({ href, etag: textOf(r, "getetag") });
     }
     resourceListCache.set(listKey, { resources: out, at: Date.now() });
@@ -257,6 +267,9 @@ export class CardDavClient {
    * §8.7). One round trip per chunk.
    */
   async multiGet(bookHref: string, hrefs: string[]): Promise<VCardResource[]> {
+    // Only members of this book: an href outside it is not a card of it, and
+    // must not be requested or reported as one.
+    hrefs = hrefs.filter((h) => this.isMember(bookHref, h));
     if (hrefs.length === 0) return [];
 
     // Serve anything whose current etag we know and whose body we already
@@ -283,7 +296,7 @@ export class CardDavClient {
     for (const r of responses) {
       const href = extractHref(r);
       const data = textOf(r, "address-data");
-      if (!href || !data) continue;
+      if (!href || !data || !this.isMember(bookHref, href)) continue;
       const etag = textOf(r, "getetag");
       if (etag) rememberVCard(this.vcardKey(href, etag), data);
       out.push({ href, etag, data });
@@ -381,29 +394,96 @@ export class CardDavClient {
 
   // -- low-level ----------------------------------------------------------
 
+  /**
+   * The request URL for an href, which must be on the configured server: same
+   * scheme, host and port, no userinfo, query or fragment. Everything that
+   * carries our Authorization header goes through here, so an href from a
+   * client (a forged contact id) or from the server (a multistatus body, a
+   * redirect) can never send the credentials anywhere else.
+   */
+  resolve(href: string, base: string = this.origin): URL {
+    let url: URL;
+    try {
+      url = new URL(href, base + (base === this.origin ? "/" : ""));
+    } catch {
+      throw new CardDavHrefError(href);
+    }
+    if (url.origin !== this.origin || url.username || url.password || url.search || url.hash) {
+      throw new CardDavHrefError(href);
+    }
+    return url;
+  }
+
+  /** Path of a server-supplied href, checked by resolve(). */
+  private serverPath(href: string): string {
+    return this.resolve(href).pathname;
+  }
+
+  /**
+   * True when `href` is on the configured server and inside the collection
+   * `collectionHref`: a direct member ("member", the only kind of resource an
+   * address book holds) or the collection or anything below it
+   * ("descendant-or-self"). Compared on decoded path segments after the URL
+   * parser's dot-segment removal, so `..`, `%2e%2e` and percent-encoding
+   * variants can't step out of the collection.
+   */
+  isWithin(collectionHref: string, href: string, rel: "member" | "descendant-or-self"): boolean {
+    let coll: string[];
+    let item: string[];
+    try {
+      coll = pathSegments(this.resolve(collectionHref).pathname);
+      item = pathSegments(this.resolve(href).pathname);
+    } catch {
+      return false;
+    }
+    if (item.length < coll.length) return false;
+    for (let i = 0; i < coll.length; i++) if (coll[i] !== item[i]) return false;
+    if (rel === "descendant-or-self") return true;
+    if (item.length !== coll.length + 1) return false;
+    const leaf = item[item.length - 1]!;
+    return leaf !== "" && leaf !== "." && leaf !== ".." && !leaf.includes("/");
+  }
+
+  /** A card resource href that belongs to the address book `bookHref`. */
+  isMember(bookHref: string, href: string): boolean {
+    return this.isWithin(bookHref, href, "member");
+  }
+
   private async raw(
     method: string,
     path: string,
     body: string | null,
     headers: Record<string, string> = {},
   ): Promise<Response> {
-    const url = absolutise(this.origin, path);
+    let url = this.resolve(path);
     // Any write invalidates the cached book list before it is issued: a PUT or
     // DELETE moves the collection's ctag (and so its JMAP state), and MKCOL /
     // PROPPATCH change the set itself. Dropping it up front rather than after
     // means a write that fails midway can't leave a stale list behind.
     if (!READ_METHODS.has(method.toUpperCase())) bookListCache.delete(this.cacheKey);
-    const res = await fetch(url, {
-      method,
-      headers: { Authorization: this.authHeader, ...headers },
-      ...(body === null ? {} : { body }),
-    });
-    log.debug({ method, url, status: res.status }, "carddav request");
-    return res;
+    // Redirects are followed by hand, and only on the configured server, so the
+    // Authorization header is never sent to wherever a Location points.
+    for (let hop = 0; ; hop++) {
+      const res = await fetch(url, {
+        method,
+        headers: { Authorization: this.authHeader, ...headers },
+        ...(body === null ? {} : { body }),
+        redirect: "manual",
+      });
+      log.debug({ method, url: url.href, status: res.status }, "carddav request");
+      const loc = isRedirect(res.status) ? res.headers.get("location") : null;
+      if (loc === null) return res;
+      if (hop >= MAX_REDIRECTS) throw new Error(`CardDAV ${method}: too many redirects`);
+      url = this.resolve(loc, url.href);
+      if (res.status === 303 && method !== "GET" && method !== "HEAD") {
+        method = "GET";
+        body = null;
+      }
+    }
   }
 
   private async followToCollection(path: string): Promise<string> {
-    let url = absolutise(this.origin, path);
+    let url = this.resolve(path);
     for (let i = 0; i < 4; i++) {
       const res = await fetch(url, {
         method: "PROPFIND",
@@ -411,19 +491,18 @@ export class CardDavClient {
         body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>',
         redirect: "manual",
       });
-      log.debug({ url, status: res.status }, "carddav discovery probe");
+      log.debug({ url: url.href, status: res.status }, "carddav discovery probe");
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get("location");
         if (!loc) break;
-        url = absolutise(this.origin, loc);
+        url = this.resolve(loc, url.href);
         continue;
       }
       // surface auth/server errors here so callers see a useful message
       if (res.status === 401 || res.status === 403) {
         throw new Error(`CardDAV ${res.status}: auth required`);
       }
-      const u = new URL(url);
-      return u.pathname.endsWith("/") ? u.pathname : u.pathname + "/";
+      return url.pathname.endsWith("/") ? url.pathname : url.pathname + "/";
     }
     throw new Error("CardDAV: too many redirects in discovery");
   }
@@ -459,6 +538,32 @@ export class CardDavClient {
   }
 }
 
+/** An href that is not on the configured CardDAV server (or not a plain path there). */
+export class CardDavHrefError extends Error {
+  constructor(readonly href: string) {
+    super("CardDAV href is not on the configured server");
+  }
+}
+
+const MAX_REDIRECTS = 4;
+
+function isRedirect(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+/** Decoded path segments, without the empty one a trailing slash leaves. */
+function pathSegments(pathname: string): string[] {
+  const segs = pathname.split("/").map((seg) => {
+    try {
+      return decodeURIComponent(seg);
+    } catch {
+      return seg;
+    }
+  });
+  if (segs.length > 1 && segs[segs.length - 1] === "") segs.pop();
+  return segs;
+}
+
 /** Thrown on 412 (If-Match / If-None-Match failed) or 405 on MKCOL (exists). */
 export class CardDavConflict extends Error {
   constructor(readonly href: string) {
@@ -489,12 +594,6 @@ function buildAuth(c: Credentials): string {
     return `Basic ${b64}`;
   }
   throw new Error(`unsupported carddav auth mech: ${c.mech}`);
-}
-
-function absolutise(origin: string, pathOrUrl: string): string {
-  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
-  if (!pathOrUrl.startsWith("/")) pathOrUrl = "/" + pathOrUrl;
-  return origin + pathOrUrl;
 }
 
 function leafName(href: string): string {

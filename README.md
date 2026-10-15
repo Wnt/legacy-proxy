@@ -37,6 +37,38 @@ Changes from upstream:
 - CI: `.github/workflows/test.yml` runs the typecheck and the unit tests on
   every push and pull request. The image workflow lower-cases the repository
   name for GHCR.
+- **Security fixes from the 2026-10 audit (findings legacy-proxy-1 to -3).**
+  - *CardDAV credentials stay on the CardDAV server.* A contact id is only
+    base64url of two hrefs, and the client used to fetch any absolute URL in
+    it with the mailbox password attached. Now every request URL goes through
+    `CardDavClient.resolve()`: same scheme, host and port as the configured
+    server, no userinfo, query or fragment. A card id must name a listed
+    address book and a direct member of it (decoded path segments, after
+    dot-segment removal), or it is `notFound` before any request. Server
+    hrefs are checked the same way: the principal and home set must be on the
+    server, address books inside the home set, cards inside their book.
+    Redirects are followed by hand and only on the same server.
+    Code: `src/carddav/client.ts`, `src/jmap/methods/contacts.ts`.
+  - *Email/set create is schema-checked.* nodemailer's `MimeNode` reads a
+    local file for a `{ path }` body, fetches a `{ href }` body and writes a
+    `{ prepared: true }` header value unencoded. `src/mapping/emailCreate.ts`
+    checks every property's JMAP type (bodies, headers, addresses, ids, dates,
+    the body structure with depth and part limits) before blob lookup or MIME
+    building, and answers `invalidProperties`. Unknown non-`header:*`
+    properties are refused too. Every `MimeNode` is built with
+    `disableFileAccess` and `disableUrlAccess`, content must be a string or
+    Buffer, and the SMTP transport disables both as well.
+  - *Header parsing is linear and bounded.* `asMessageIds`, `asURLs` and the
+    address parser used regexes that rescan the rest of a value from every
+    `<`; a sender could stall the event loop for seconds with a References
+    header of `<`s, on every listing and push lookup. They now use linear
+    scanners with the same results (fuzz-tested against the old regexes).
+    Header blocks are parsed and cached up to 512 KiB, each unfolded field up
+    to 128 KiB, and message ids holding a stray `<` or longer than 998
+    characters are skipped, so threading falls back to the next reference or
+    the message's own id. Code: `src/imap/headers.ts`, `src/imap/fetcher.ts`.
+
+  Tests: `test/unit/security-*.spec.ts` and `test/unit/contacts-set.spec.ts`.
 
 > Pre-1.0. The wire shapes, storage formats, and config keys can change without
 > notice. There is no third-party security audit. Run it for development,

@@ -20,6 +20,10 @@ export async function submit(opts: {
   const { provider, creds, envelopeFrom, rcptTo, raw } = opts;
 
   const transport = nodemailer.createTransport({
+    // The message is always our own Buffer; never let nodemailer resolve a
+    // `{ path }` or `{ href }` source.
+    disableFileAccess: true,
+    disableUrlAccess: true,
     host: provider.smtp.host,
     port: provider.smtp.port,
     secure: provider.smtp.secure ?? provider.smtp.port === 465,

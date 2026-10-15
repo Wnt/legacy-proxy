@@ -6,7 +6,13 @@ import libqp from "libqp";
 import { selectBodies, structureToBodyParts, type EmailBodyPart } from "../mapping/structure.js";
 import { flagsToKeywords } from "../mapping/flags.js";
 import { encodeBlobId, encodeEmailId, encodeMailboxId } from "../mapping/ids.js";
-import { parseHeaderBlock, asMessageIds, computeThreadIdFromHeaders, type ParsedHeader } from "./headers.js";
+import {
+  parseHeaderBlock,
+  asMessageIds,
+  computeThreadIdFromHeaders,
+  MAX_HEADER_BLOCK_BYTES,
+  type ParsedHeader,
+} from "./headers.js";
 import { imapErrorDetails } from "./client.js";
 import { fetchByUid } from "./uids.js";
 import type { AccountRow, MailboxRow, Store, EmailCacheUpsert } from "../state/store.js";
@@ -187,10 +193,14 @@ interface ProcessedMeta {
   headers: ParsedHeader[];
 }
 
+// Only the first MAX_HEADER_BLOCK_BYTES are ever parsed, so that is all we keep
+// (and cache): a sender can't make every later read carry a huge header block.
 function headersToBuffer(headers: FetchMessageObject["headers"]): Buffer {
-  if (Buffer.isBuffer(headers)) return headers;
-  if (typeof headers === "string") return Buffer.from(headers, "utf8");
-  return Buffer.alloc(0);
+  let buf: Buffer;
+  if (Buffer.isBuffer(headers)) buf = headers;
+  else if (typeof headers === "string") buf = Buffer.from(headers, "utf8");
+  else return Buffer.alloc(0);
+  return buf.length > MAX_HEADER_BLOCK_BYTES ? Buffer.from(buf.subarray(0, MAX_HEADER_BLOCK_BYTES)) : buf;
 }
 
 function rawFromFetch(msg: FetchMessageObject, headersFull: boolean): RawMeta {

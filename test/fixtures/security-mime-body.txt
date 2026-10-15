@@ -1,0 +1,1 @@
+This is an audit-only file-read sentinel, not an uploaded mail body.

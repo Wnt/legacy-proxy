@@ -233,6 +233,77 @@ const ALICE = [
 
 let dav: FakeDav;
 
+describe("security: contact resource boundaries", () => {
+  // No network is used: the real handler and CardDavClient run against fetch mocks.
+  function recordForeign(prefix: string): RequestInit[] {
+    const original = globalThis.fetch;
+    const seen: RequestInit[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: any, init?: RequestInit) => {
+      if (String(input instanceof URL ? input.href : input).startsWith(prefix)) {
+        seen.push(init!);
+        return new Response(null, { status: 204 });
+      }
+      return original(input, init);
+    }));
+    return seen;
+  }
+
+  it("does not send the mailbox password to a URL encoded in a contact id", async () => {
+    const book = dav.addBook("personal", "Personal");
+    const foreign = "https://collector.example.test/contact.vcf";
+    const forgedId = Buffer.from(`${book}\n${foreign}`).toString("base64url");
+    const foreignRequests = recordForeign("https://collector.example.test");
+
+    const result = await contactCardSet({ accountId: "7", destroy: [forgedId] }, ctx);
+    expect(foreignRequests.map((r) => new Headers(r.headers).get("authorization"))).toEqual([]);
+    expect(result.notDestroyed?.[forgedId]?.type).toBe("notFound");
+  });
+
+  it("rejects forged ids on update and get without any request for them", async () => {
+    const book = dav.addBook("personal", "Personal", [["alice.vcf", ALICE]]);
+    const other = dav.addBook("other", "Other", [["bob.vcf", ALICE.replace("alice-uid", "bob-uid")]]);
+    const forged = [
+      "https://collector.example.test/books/u/personal/x.vcf", // other host, member-shaped path
+      "//collector.example.test/x.vcf",                           // scheme-relative
+      "https://u:p@dav.test/books/u/personal/alice.vcf",         // userinfo
+      "http://dav.test/books/u/personal/alice.vcf",              // other scheme
+      `${book}../other/bob.vcf`,                                 // dot segments out of the book
+      `${book}%2e%2e/other/bob.vcf`,                             // encoded dot segments
+      `${book}sub/alice.vcf`,                                    // not a direct member
+      `${book}a%2Fb.vcf`,                                        // encoded slash
+      `${book}alice.vcf?x=1`,                                    // query
+      `${other}bob.vcf`,                                         // member of another book
+    ].map((href) => Buffer.from(`${book}\n${href}`).toString("base64url"));
+    const foreignRequests = recordForeign("https://collector.example.test");
+    const before = dav.calls.length;
+
+    const upd = await contactCardSet({
+      accountId: "7",
+      update: Object.fromEntries(forged.map((id) => [id, { name: { full: "x" } }])),
+    }, ctx);
+    for (const id of forged) expect(upd.notUpdated?.[id]?.type).toBe("notFound");
+    const got = await contactCardGet({ accountId: "7", ids: forged }, ctx);
+    expect(got.list).toEqual([]);
+    expect(got.notFound).toEqual(forged);
+    const del = await contactCardSet({ accountId: "7", destroy: forged }, ctx);
+    for (const id of forged) expect(del.notDestroyed?.[id]?.type).toBe("notFound");
+
+    expect(foreignRequests).toEqual([]);
+    // Nothing but listings reached the real server: no PUT, DELETE or REPORT.
+    expect(dav.calls.slice(before).filter((c) => c.method !== "PROPFIND")).toEqual([]);
+    expect(dav.books.get(other)!.resources.size).toBe(1);
+  });
+
+  it("still updates and deletes a real card whose id spells the href differently", async () => {
+    const book = dav.addBook("personal", "Personal", [["alice.vcf", ALICE]]);
+    // Same resource, absolute URL on the configured origin, as some servers report it.
+    const id = Buffer.from(`${book}\nhttps://dav.test:443${book}alice.vcf`).toString("base64url");
+    const del = await contactCardSet({ accountId: "7", destroy: [id] }, ctx);
+    expect(del.destroyed).toEqual([id]);
+    expect(dav.books.get(book)!.resources.size).toBe(0);
+  });
+});
+
 beforeEach(() => {
   // Each case gets a fresh server behind the same origin+user, so the client's
   // cross-instance discovery/book caches must be cleared with it.

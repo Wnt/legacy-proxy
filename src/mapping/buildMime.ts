@@ -5,6 +5,23 @@
 // quoted-printable encoding, header folding, and message id generation.
 
 import MimeNode from "nodemailer/lib/mime-node/index.js";
+import { validateEmailCreate } from "./emailCreate.js";
+
+// Every node is built with file and URL sources disabled. setContent() also
+// accepts `{ path }` (read a local file) and `{ href }` (fetch a URL), and a
+// node does not inherit these options from its parent, so set them on each.
+function mimeNode(contentType: string, hostname: string): MimeNode {
+  return new MimeNode(contentType, { hostname, disableFileAccess: true, disableUrlAccess: true });
+}
+
+// Content is only ever text or bytes; anything else is refused rather than
+// handed to MimeNode, which would interpret it.
+function setContent(node: MimeNode, content: unknown): void {
+  if (typeof content !== "string" && !Buffer.isBuffer(content)) {
+    throw new TypeError("MIME part content must be a string or Buffer");
+  }
+  node.setContent(content);
+}
 
 interface JmapAddress {
   name?: string | null;
@@ -85,7 +102,7 @@ function nodeFromBodyStructure(
 ): MimeNode {
   const type = part.type ?? "text/plain";
   if (type.toLowerCase().startsWith("multipart/")) {
-    const node = new MimeNode(type, { hostname });
+    const node = mimeNode(type, hostname);
     for (const child of part.subParts ?? []) {
       node.appendChild(nodeFromBodyStructure(child, bodyValues, getBlob, hostname));
     }
@@ -103,17 +120,17 @@ function nodeFromBodyStructure(
   if (type.toLowerCase().startsWith("text/")) {
     contentType = `${type}; charset=${part.charset ?? "utf-8"}`;
   }
-  const node = new MimeNode(contentType, { hostname });
+  const node = mimeNode(contentType, hostname);
   for (const [k, v] of Object.entries(headers)) node.setHeader(k, v);
 
   if (part.partId && bodyValues?.[part.partId]?.value !== undefined) {
-    node.setContent(bodyValues[part.partId]!.value!);
+    setContent(node, bodyValues[part.partId]!.value);
   } else if (part.blobId) {
     const blob = getBlob(part.blobId);
     // An empty part would go out as a blank file or a broken inline image;
     // refuse the message instead.
     if (!blob) throw new MissingBlobError(part.blobId);
-    node.setContent(blob.body);
+    setContent(node, blob.body);
   }
   return node;
 }
@@ -154,7 +171,7 @@ function wrapAttachments(
   let root = body;
   for (const [type, parts] of [["multipart/related", related], ["multipart/mixed", mixed]] as const) {
     if (!parts.length) continue;
-    const wrapper = new MimeNode(type, { hostname });
+    const wrapper = mimeNode(type, hostname);
     wrapper.appendChild(root);
     for (const p of parts) {
       wrapper.appendChild(nodeFromBodyStructure({ ...p, disposition: p.disposition ?? "attachment" }, null, getBlob, hostname));
@@ -177,6 +194,9 @@ export async function buildRfc822(
   getBlob: BlobLookup = () => null,
   keepBcc = false,
 ): Promise<Buffer> {
+  // Callers validate first to answer with invalidProperties; this is the
+  // backstop for any caller that didn't.
+  validateEmailCreate(create);
   // Choose a root structure based on the inputs we got. Prefer `bodyStructure`
   // (RFC 8621 §4.5.1 form 1) when present — it's the canonical source of
   // truth and drives multipart/alternative + attachments. Otherwise fall back
@@ -188,15 +208,15 @@ export async function buildRfc822(
     const text = resolveBody(create.textBody, create.bodyValues);
     const html = resolveBody(create.htmlBody, create.bodyValues);
     if (text && html) {
-      root = new MimeNode("multipart/alternative", { hostname });
-      root.createChild("text/plain; charset=utf-8").setContent(text);
-      root.createChild("text/html; charset=utf-8").setContent(html);
+      root = mimeNode("multipart/alternative", hostname);
+      setContent(root.appendChild(mimeNode("text/plain; charset=utf-8", hostname)), text);
+      setContent(root.appendChild(mimeNode("text/html; charset=utf-8", hostname)), html);
     } else if (html) {
-      root = new MimeNode("text/html; charset=utf-8", { hostname });
-      root.setContent(html);
+      root = mimeNode("text/html; charset=utf-8", hostname);
+      setContent(root, html);
     } else {
-      root = new MimeNode("text/plain; charset=utf-8", { hostname });
-      root.setContent(text ?? "");
+      root = mimeNode("text/plain; charset=utf-8", hostname);
+      setContent(root, text ?? "");
     }
     root = wrapAttachments(root, create.attachments ?? [], html !== null, getBlob, hostname);
   }

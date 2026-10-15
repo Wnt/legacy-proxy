@@ -15,6 +15,7 @@ import { headersToEmailHeaders, projectHeaderProp } from "../../imap/headers.js"
 import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
 import { buildRfc822, MissingBlobError, type BodyStructurePart, type JmapEmailCreate } from "../../mapping/buildMime.js";
+import { InvalidEmailCreateError, validateEmailCreate } from "../../mapping/emailCreate.js";
 import { readBlob } from "../blobs.js";
 import {
   changesFromLog,
@@ -1469,6 +1470,15 @@ async function applyEmailCreate(
   payload: Record<string, unknown>,
   ctx: MailCtx,
 ): Promise<CreatedEmailResult> {
+  // Types first: nothing below may see an object where JMAP has a string.
+  try {
+    validateEmailCreate(payload);
+  } catch (e) {
+    if (e instanceof InvalidEmailCreateError) {
+      throw new JmapError("invalidProperties", e.message, { properties: e.properties });
+    }
+    throw e;
+  }
   // Resolve target mailbox (single-membership only).
   const mailboxIds = payload.mailboxIds;
   if (!mailboxIds || typeof mailboxIds !== "object") {

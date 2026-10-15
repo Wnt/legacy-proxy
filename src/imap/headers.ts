@@ -13,8 +13,20 @@ export interface ParsedHeader {
   rawValue: string;   // value AFTER folded-line unwrapping but before decoding
 }
 
+// Upper bounds on what a message's sender can make us parse. A header block
+// is fetched and parsed on every listing, thread scan and push lookup, so its
+// cost must not depend on how much a sender stuffs into it. Generous for real
+// mail: a 1,000-message References chain is ~60 KB, and whole header blocks
+// with long Received/ARC chains stay well under 100 KB.
+export const MAX_HEADER_BLOCK_BYTES = 512 * 1024;
+export const MAX_HEADER_FIELD_CHARS = 128 * 1024;
+const MAX_MSG_ID_CHARS = 998; // RFC 5322 §2.1.1 line limit
+
 export function parseHeaderBlock(block: string | Buffer): ParsedHeader[] {
-  const text = typeof block === "string" ? block : block.toString("utf8");
+  const text =
+    typeof block === "string"
+      ? block.slice(0, MAX_HEADER_BLOCK_BYTES)
+      : block.subarray(0, MAX_HEADER_BLOCK_BYTES).toString("utf8");
   // RFC 5322 header lines end at LF with optional CR; continuation lines start
   // with whitespace. Unfold first, then split on header boundaries.
   const lines = text.replace(/\r\n/g, "\n").split("\n");
@@ -23,14 +35,16 @@ export function parseHeaderBlock(block: string | Buffer): ParsedHeader[] {
   for (const line of lines) {
     if (line === "") break; // empty line ends the header section
     if (/^[ \t]/.test(line)) {
-      // continuation
-      if (cur) cur.rawValue += " " + line.replace(/^[ \t]+/, "");
+      // continuation; a field past the cap keeps its (truncated) start
+      if (cur && cur.rawValue.length < MAX_HEADER_FIELD_CHARS) {
+        cur.rawValue = (cur.rawValue + " " + line.replace(/^[ \t]+/, "")).slice(0, MAX_HEADER_FIELD_CHARS);
+      }
       continue;
     }
     const m = /^([!-9;-~]+):[ \t]*(.*)$/.exec(line);
     if (!m) continue;
     if (cur) out.push(cur);
-    cur = { name: m[1]!, rawValue: m[2]! };
+    cur = { name: m[1]!, rawValue: m[2]!.slice(0, MAX_HEADER_FIELD_CHARS) };
   }
   if (cur) out.push(cur);
   return out;
@@ -109,10 +123,10 @@ export function parseAddressList(value: string): { groups: { name: string | null
     token = "";
     if (!t) return;
     // Match `Display Name <foo@bar>` or just `foo@bar`.
-    const angle = /^(.*)<([^>]+)>\s*$/.exec(t);
+    const angle = splitAngleAddr(t);
     if (angle) {
-      const name = angle[1]!.trim().replace(/^"|"$/g, "").replace(/\\(.)/g, "$1");
-      buf.addresses.push({ name: name ? decodeWords(name) : null, email: angle[2]!.trim() });
+      const name = angle.name.trim().replace(/^"|"$/g, "").replace(/\\(.)/g, "$1");
+      buf.addresses.push({ name: name ? decodeWords(name) : null, email: angle.addr.trim() });
       return;
     }
     if (/@/.test(t)) buf.addresses.push({ name: null, email: t });
@@ -199,14 +213,54 @@ export function asGroupedAddresses(
   return groups;
 }
 
+// `<...>` items of a header value, in order: the text between each `<` and the
+// next `>`, skipping empty pairs, and everything after an unclosed `<`. Same
+// result as /<([^>]+)>/g, but one linear pass: that regex rescans the rest of
+// the value from every `<` when no `>` follows, which a sender can turn into
+// seconds of event-loop time with a header of nothing but `<`s.
+export function bracketed(value: string): string[] {
+  const out: string[] = [];
+  let i = 0;
+  for (;;) {
+    const open = value.indexOf("<", i);
+    if (open < 0) break;
+    const close = value.indexOf(">", open + 1);
+    if (close < 0) break;
+    if (close === open + 1) {
+      i = open + 1; // "<>": the regex needs one character, so it moves on
+      continue;
+    }
+    out.push(value.slice(open + 1, close));
+    i = close + 1;
+  }
+  return out;
+}
+
+// `Display Name <addr>` -> { name, addr }, or null when the token doesn't end in
+// a non-empty `<...>`. Equivalent to /^(.*)<([^>]+)>\s*$/ without its quadratic
+// backtracking on a token full of `<`.
+export function splitAngleAddr(t: string): { name: string; addr: string } | null {
+  const close = t.lastIndexOf(">");
+  if (close < 1 || t.slice(close + 1).trim() !== "") return null;
+  // Greedy (.*): the last `<` that still leaves a non-empty address.
+  const open = close >= 2 ? t.lastIndexOf("<", close - 2) : -1;
+  if (open < 0) return null;
+  if (t.lastIndexOf(">", close - 1) > open) return null;
+  return { name: t.slice(0, open), addr: t.slice(open + 1, close) };
+}
+
 export function asMessageIds(headers: ParsedHeader[], name: string): string[] | null {
   const matches = findHeaders(headers, name);
   if (matches.length === 0) return null;
   const ids: string[] = [];
   for (const h of matches) {
-    const re = /<([^>]+)>/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(h.rawValue)) !== null) ids.push(m[1]!);
+    for (const id of bracketed(h.rawValue)) {
+      // Malformed: an unclosed `<` swallowed into the next id, or longer than
+      // a header line may be. Skip it, so threading falls back to the next
+      // reference or the message's own id.
+      if (id.includes("<") || id.length > MAX_MSG_ID_CHARS) continue;
+      ids.push(id);
+    }
   }
   return ids.length ? ids : null;
 }
@@ -215,11 +269,7 @@ export function asURLs(headers: ParsedHeader[], name: string): string[] | null {
   const matches = findHeaders(headers, name);
   if (matches.length === 0) return null;
   const urls: string[] = [];
-  for (const h of matches) {
-    const re = /<([^>]+)>/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(h.rawValue)) !== null) urls.push(m[1]!.trim());
-  }
+  for (const h of matches) for (const u of bracketed(h.rawValue)) urls.push(u.trim());
   return urls.length ? urls : null;
 }
 
