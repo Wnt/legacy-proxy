@@ -22,7 +22,11 @@ Changes from upstream:
   - `queryState`, `Email/get` `state` and the SEARCH cache use the state the
     connection's view includes;
   - the IDLE worker records INBOX arrivals, expunges and flag changes as
-    created, destroyed and updated ids before it bumps `EmailDelivery`;
+    created, destroyed and updated ids before it bumps `EmailDelivery`. It
+    looks the ids up on a pooled connection, so its own socket stays in IDLE.
+    It enters IDLE at once instead of after imapflow's 15 s delay, and then
+    catches up, because Stalwart doesn't announce mail that arrived outside
+    IDLE when IDLE starts;
   - any state bump without ids makes `*/changes` across it answer
     `cannotCalculateChanges`.
 

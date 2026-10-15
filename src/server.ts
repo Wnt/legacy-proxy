@@ -30,7 +30,7 @@ const store = new Store(cfg.dataDir);
 const pool = new ImapPool(cfg, store);
 const hub = new EventSourceHub();
 const dispatcher = new PushDispatcher(store, hub, (id) => store.getAccountById(id));
-const idleManager = new PushIdleManager(cfg, store);
+const idleManager = new PushIdleManager(cfg, store, pool);
 
 // Hook the store so every counter bump (Email/set, Mailbox/set, IDLE arrival,
 // EmailSubmission/set...) feeds the same fan-out path. The dispatcher

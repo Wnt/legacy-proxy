@@ -15,7 +15,8 @@ import { ImapFlow } from "imapflow";
 import type { Credentials } from "../auth/credentials.js";
 import { openCredentials } from "../auth/credentials.js";
 import { resolveProvider } from "../auth/providers.js";
-import { openImap } from "../imap/client.js";
+import { openImap, withMailbox } from "../imap/client.js";
+import type { ImapPool } from "../imap/pool.js";
 import type { Store, AccountRow } from "../state/store.js";
 import type { AppConfig } from "../util/config.js";
 import { log } from "../util/log.js";
@@ -32,6 +33,10 @@ const RECONNECT_MAX_MS = 60_000;
 // IDLE before that to keep the channel alive.
 const IDLE_REFRESH_MS = 25 * 60_000;
 
+// How long after sending IDLE we assume the server has acknowledged it, and
+// run the catch-up diff (see enterIdle). Generous next to one round trip.
+const IDLE_SETTLE_MS = 1_000;
+
 // imapflow's IDLE helper is fire-and-await: it returns when IDLE ends. We
 // kick it off in the background and rotate before the server times us out.
 interface Worker {
@@ -44,9 +49,7 @@ interface Worker {
   // across reconnects so the next connection can report what changed while
   // the socket was down. Null until the first connection has listed INBOX.
   inbox: { uidValidity: number; uids: number[] } | null;
-  // Events whose diff is still being computed. They run one at a time, in
-  // arrival order, on `queue`.
-  pending: number;
+  // Diffs run one at a time, in event order, on this chain.
   queue: Promise<void>;
 }
 
@@ -56,6 +59,9 @@ export class PushIdleManager {
   constructor(
     private cfg: AppConfig,
     private store: Store,
+    // Request-path connections, used to look up the UIDs behind IDLE events
+    // so the IDLE socket itself never leaves IDLE for it.
+    private pool: ImapPool,
   ) {}
 
   // Compute the desired set from the DB and converge `workers` onto it.
@@ -100,7 +106,6 @@ export class PushIdleManager {
       refreshTimer: null,
       backoffMs: RECONNECT_MIN_MS,
       inbox: null,
-      pending: 0,
       queue: Promise.resolve(),
     };
     this.workers.set(accountId, worker);
@@ -135,7 +140,8 @@ export class PushIdleManager {
     // Email/changes from the previous state lists exactly what arrived or
     // vanished. Where the ids cannot be known, the state is bumped as a gap
     // (Store.bumpState) and Email/changes answers cannotCalculateChanges:
-    // never an empty `created` with a newer state.
+    // never an empty `created` with a newer state. The ids are looked up on a
+    // pooled connection (syncInbox), never on this socket: it stays in IDLE.
     //
     // imapflow's `'exists'` event tells us the post-mutation count + the
     // previous count. A higher count is a new arrival; equal/lower happens on
@@ -156,20 +162,14 @@ export class PushIdleManager {
       this.enqueue(account, worker, client, "full");
     });
 
-    client.on("flags", (ev: { seq: number; uid?: number }) => {
+    client.on("flags", (ev: { uid?: number }) => {
       // Read/Flagged toggles from another device land here. No EmailDelivery
-      // bump (no new mail), but Email state moved. The sequence number maps
-      // to a UID only while our list is in step with the server's view.
+      // bump (no new mail), but Email state moved. Servers usually include
+      // the UID (Stalwart does); without it the change is a gap.
       const inbox = worker.inbox;
-      const inStep =
-        inbox !== null &&
-        worker.client === client &&
-        worker.pending === 0 &&
-        inbox.uids.length === (client.mailbox ? client.mailbox.exists : -1);
-      const uid = ev.uid ?? (inStep ? inbox.uids[ev.seq - 1] : undefined);
-      if (inbox && uid !== undefined) {
+      if (inbox && ev.uid !== undefined) {
         this.store.recordChanges(account.id, "email", {
-          updated: [this.emailId(account.id, inbox.uidValidity, uid)],
+          updated: [this.emailId(account.id, inbox.uidValidity, ev.uid)],
         });
       } else {
         this.store.bumpState(account.id, "email");
@@ -192,25 +192,13 @@ export class PushIdleManager {
     // interrupted by a mid-flight FETCH on this socket.
     await client.mailboxOpen("INBOX");
 
-    // Learn INBOX's UIDs. On a reconnect, report what changed while the
-    // socket was down as a diff against the list we had. On the first
-    // connection (or a new UIDVALIDITY) nobody was watching before, so the
-    // state jumps as a gap: Email/changes from any earlier state must not
-    // pretend it knows what arrived meanwhile.
-    const uidValidity = client.mailbox ? Number(client.mailbox.uidValidity) : 0;
-    const uids = await searchUids(client, { all: true });
-    const prev = worker.inbox;
-    worker.inbox = { uidValidity, uids };
-    if (prev && prev.uidValidity === uidValidity) {
-      this.recordDiff(account, prev.uids, uids, uidValidity);
-    } else {
-      this.store.bumpState(account.id, "email");
-      this.store.bumpState(account.id, "mailbox");
-    }
-
     worker.client = client;
     worker.backoffMs = RECONNECT_MIN_MS;
     log.info({ accountId: account.id, host: provider.imap.host }, "idle: connected");
+
+    // IDLE now, then learn (first connection) or diff (reconnect) INBOX's
+    // UIDs: see enterIdle.
+    this.enterIdle(account, worker, client);
 
     // Start the IDLE rotation. imapflow runs IDLE automatically when the
     // connection is otherwise quiet, but we explicitly cycle it before the
@@ -218,43 +206,65 @@ export class PushIdleManager {
     this.scheduleIdleRefresh(account, worker);
   }
 
+  // Put the socket into IDLE at once, then catch up on a pooled connection.
+  // Some servers (Stalwart) tell a session about mail that arrived while it
+  // was not IDLE only on NOOP: not on SEARCH, and not when IDLE starts. So
+  // whenever this socket is outside IDLE (after connecting, after the refresh
+  // NOOP; imapflow on its own would wait autoIdleDelay, 15 s) mail can arrive
+  // unannounced. The "full" diff afterwards finds it. imapflow does not expose
+  // the server's IDLE acknowledgement, so it runs IDLE_SETTLE_MS later.
+  private enterIdle(account: AccountRow, worker: Worker, client: ImapFlow): void {
+    client.idle().catch(() => {}); // resolves when IDLE ends; failures surface as close
+    const timer = setTimeout(() => this.enqueue(account, worker, client, "full"), IDLE_SETTLE_MS);
+    timer.unref?.();
+  }
+
   // Run diffs one at a time in event order: each one reads and replaces
   // worker.inbox.
   private enqueue(account: AccountRow, worker: Worker, client: ImapFlow, kind: "arrival" | "full"): void {
-    worker.pending++;
-    worker.queue = worker.queue
-      .then(() => this.syncInbox(account, worker, client, kind))
-      .finally(() => {
-        worker.pending--;
-      });
+    worker.queue = worker.queue.then(() => this.syncInbox(account, worker, client, kind));
   }
 
   // Bring worker.inbox in step with the server and record the difference.
   // "arrival" only asks for UIDs above the highest known one (new mail always
-  // gets a higher UID); "full" re-lists INBOX, which an expunge needs.
+  // gets a higher UID); "full" re-lists INBOX, which an expunge needs. The
+  // first listing, or one after UIDVALIDITY changed, is a gap: nobody watched
+  // before, so Email/changes from an earlier state must not pretend to know
+  // what arrived meanwhile.
   private async syncInbox(
     account: AccountRow,
     worker: Worker,
     client: ImapFlow,
     kind: "arrival" | "full",
   ): Promise<void> {
+    if (worker.closing || worker.client !== client) return; // superseded by a reconnect
     const inbox = worker.inbox;
-    if (worker.client !== client || !inbox) return; // superseded by a reconnect
     try {
-      let now: number[];
-      if (kind === "arrival") {
-        const max = inbox.uids.length > 0 ? inbox.uids[inbox.uids.length - 1]! : 0;
-        // `n:*` always includes the highest UID, even when it is below n.
-        const above = (await searchUids(client, { uid: `${max + 1}:*` })).filter((u) => u > max);
-        now = inbox.uids.concat(above);
+      const seen = await this.pool.withConnection(account, "interactive", (c) =>
+        withMailbox(c, "INBOX", async () => {
+          // The pooled session may not have been told about the change yet.
+          await c.noop();
+          const uidValidity = c.mailbox ? Number(c.mailbox.uidValidity) : 0;
+          if (kind === "arrival" && inbox && inbox.uidValidity === uidValidity) {
+            const max = inbox.uids.length > 0 ? inbox.uids[inbox.uids.length - 1]! : 0;
+            // `n:*` always includes the highest UID, even when it is below n.
+            const above = (await searchUids(c, { uid: `${max + 1}:*` })).filter((u) => u > max);
+            return { uidValidity, uids: inbox.uids.concat(above) };
+          }
+          return { uidValidity, uids: await searchUids(c, { all: true }) };
+        }),
+      );
+      worker.inbox = seen;
+      if (inbox && inbox.uidValidity === seen.uidValidity) {
+        this.recordDiff(account, inbox.uids, seen.uids, seen.uidValidity);
       } else {
-        now = await searchUids(client, { all: true });
+        this.store.bumpState(account.id, "email");
+        if (kind === "arrival") this.store.bumpState(account.id, "email_delivery");
+        this.store.bumpState(account.id, "mailbox");
       }
-      worker.inbox = { uidValidity: inbox.uidValidity, uids: now };
-      this.recordDiff(account, inbox.uids, now, inbox.uidValidity);
     } catch (err) {
       // We can't name the ids: announce the change as a gap, and forget the
-      // list so the reconnect this error usually precedes starts over.
+      // list so the next sync starts over.
       log.warn({ accountId: account.id, err: (err as Error).message }, "idle: inbox sync failed");
       worker.inbox = null;
       this.store.bumpState(account.id, "email");
@@ -304,9 +314,11 @@ export class PushIdleManager {
       // A NOOP both bumps the inactivity counter on the server side and
       // forces imapflow to drop+resume IDLE. Any failure here cascades to
       // the close handler, which will reconnect.
-      c.noop().catch((err: Error) => {
-        log.warn({ accountId: account.id, err: err.message }, "idle: refresh noop failed");
-      });
+      c.noop()
+        .then(() => this.enterIdle(account, worker, c))
+        .catch((err: Error) => {
+          log.warn({ accountId: account.id, err: err.message }, "idle: refresh noop failed");
+        });
       this.scheduleIdleRefresh(account, worker);
     }, IDLE_REFRESH_MS);
   }

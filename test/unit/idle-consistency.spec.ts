@@ -27,6 +27,8 @@ class FakeServer {
   uidValidity = 7;
   messages: Msg[] = [];
   sessions = new Set<FakeSession>();
+  // Called when a session SELECTs INBOX with mailboxOpen (the IDLE worker).
+  onOpen: (() => void) | null = null;
   private nextUid = 1;
 
   deliver(subject: string): number {
@@ -37,13 +39,13 @@ class FakeServer {
   }
 
   // Another client sets a flag: IDLE-ing sessions get an untagged FETCH
-  // FLAGS with only the sequence number, as servers without QRESYNC send.
+  // with FLAGS and UID, as Stalwart sends it.
   flag(uid: number, flag: string): void {
     const m = this.messages.find((x) => x.uid === uid)!;
     m.flags.add(flag);
     for (const s of this.sessions) {
       const seq = s.view.findIndex((x) => x.uid === uid) + 1;
-      if (s.idling && seq > 0) s.emit("flags", { path: "INBOX", seq, flags: m.flags });
+      if (s.idling && seq > 0) s.emit("flags", { path: "INBOX", seq, uid, flags: m.flags });
     }
   }
 
@@ -58,8 +60,8 @@ let server = new FakeServer();
 class FakeSession extends EventEmitter {
   usable = true;
   noopCalls = 0;
-  // Becomes true once the IDLE worker opened INBOX with mailboxOpen; the
-  // worker never issues commands besides SEARCH, so it is IDLE otherwise.
+  // True once the session sent IDLE. Like Stalwart, entering IDLE does not
+  // announce what arrived before; only changes during IDLE (or a NOOP) do.
   idling = false;
   // What this session has been told INBOX contains.
   view: Msg[] = [];
@@ -99,8 +101,12 @@ class FakeSession extends EventEmitter {
 
   async mailboxOpen(p: string) {
     this.select(p);
-    this.idling = true;
+    server.onOpen?.();
     return this.mailbox;
+  }
+
+  async idle(): Promise<void> {
+    this.idling = true;
   }
 
   async getMailboxLock(p: string) {
@@ -181,6 +187,12 @@ let pool: InstanceType<typeof ImapPool>;
 let idle: InstanceType<typeof PushIdleManager>;
 let inboxId: string;
 
+/** Wait past the worker's post-IDLE catch-up (IDLE_SETTLE_MS = 1 s). */
+async function caughtUp(): Promise<void> {
+  await new Promise((r) => setTimeout(r, 1_100));
+  await settled();
+}
+
 /** Wait until the IDLE worker has finished processing what it was told. */
 async function settled(): Promise<void> {
   for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
@@ -221,10 +233,10 @@ beforeEach(async () => {
   server.deliver("old two");
 
   pool = new ImapPool(cfg, store);
-  idle = new PushIdleManager(cfg, store);
+  idle = new PushIdleManager(cfg, store, pool);
   store.accountsWithActivePushSubs = () => [account.id];
   await idle.sync();
-  await settled();
+  await caughtUp();
 });
 
 afterEach(async () => {
@@ -294,10 +306,11 @@ describe("IDLE-announced changes are visible on the request path", () => {
 
   it("does not NOOP a recently used connection while nothing changed", async () => {
     await query();
+    const noops = () => [...server.sessions].reduce((n, s) => n + s.noopCalls, 0);
+    const before = noops();
     await query();
     await get([]);
-    const noops = [...server.sessions].reduce((n, s) => n + s.noopCalls, 0);
-    expect(noops).toBe(0);
+    expect(noops()).toBe(before);
   });
 
   it("reports expunges as destroyed and stays consistent", async () => {
@@ -331,13 +344,34 @@ describe("IDLE-announced changes are visible on the request path", () => {
     server.sessions.delete(worker);
     worker.emit("close");
     server.deliver("while away");
-    await new Promise((r) => setTimeout(r, 1_100)); // reconnect backoff
-    await settled();
+    await new Promise((r) => setTimeout(r, 1_000)); // reconnect backoff
+    await caughtUp();
 
     const ch = await changes(before.queryState);
     expect(ch.created).toHaveLength(1);
     const after = await query();
     expect(after.ids[0]).toBe(ch.created[0]);
+  });
+
+  it("finds mail that arrived after SELECT but before IDLE started", async () => {
+    // The server announces nothing for that window, neither on IDLE start
+    // nor later, until something else happens: the catch-up must find it.
+    const before = await query();
+    const worker = [...server.sessions].find((s) => s.idling)!;
+    server.onOpen = () => {
+      server.onOpen = null;
+      server.deliver("in the blind window");
+    };
+    worker.usable = false;
+    server.sessions.delete(worker);
+    worker.emit("close");
+    await new Promise((r) => setTimeout(r, 1_000)); // reconnect backoff
+    await caughtUp();
+
+    const ch = await changes(before.queryState);
+    expect(ch.created).toHaveLength(1);
+    const got = await get(ch.created);
+    expect(got.list[0]).toMatchObject({ subject: "in the blind window" });
   });
 });
 
