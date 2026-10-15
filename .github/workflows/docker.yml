@@ -22,7 +22,9 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # IMAGE_NAME is set in each job (GITHUB_ENV) to the lower-cased repository:
+  # GHCR and buildx `name=` reject upper case, and this fork's owner (Wnt)
+  # has some. A workflow-level env value would override GITHUB_ENV.
 
 jobs:
   build:
@@ -42,6 +44,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Lower-case image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Prepare platform slug
         run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
@@ -104,6 +109,9 @@ jobs:
       attestations: write
 
     steps:
+      - name: Lower-case image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
