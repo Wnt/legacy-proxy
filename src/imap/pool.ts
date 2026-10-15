@@ -14,9 +14,41 @@ interface PoolEntry {
   // per socket, so handing one connection to two concurrent callers would
   // queue them behind each other — exactly what the pool exists to avoid.
   busy: boolean;
+  // The account's mail state (see `mailState`) this connection's view is
+  // known to include: read just before its last NOOP, or before it was
+  // opened.
+  synced: MailState;
 }
 
-// Skip the sanity-NOOP if the connection was used within this window.
+// Account state counters that move whenever a mailbox's contents change:
+// IDLE untaggeds (new mail, expunges, flag changes from other clients) and
+// our own Email/set, Email/import, EmailSubmission and Mailbox/set all bump
+// one of them.
+interface MailState {
+  email: number;
+  mailbox: number;
+}
+
+function mailState(store: Store, accountId: number): MailState {
+  return { email: store.getState(accountId, "email"), mailbox: store.getState(accountId, "mailbox") };
+}
+
+// The email state each pooled connection's view includes, for callers that
+// stamp results with a state (Email/query's queryState, Email/get's state,
+// the SEARCH cache). Keyed by client so it follows the connection.
+const syncedEmailState = new WeakMap<ImapFlow, number>();
+
+/**
+ * The email state that results read on `client` are guaranteed to include,
+ * or undefined for a connection that is not from the pool.
+ */
+export function viewEmailState(client: ImapFlow): number | undefined {
+  return syncedEmailState.get(client);
+}
+
+// Skip the sanity-NOOP if the connection was used within this window AND the
+// account's mail state has not moved since the connection last synced (see
+// takeFree: a state change always forces the NOOP).
 // Every JMAP method funnels through acquire, so a per-call NOOP adds one IMAP
 // round-trip to every request - visible as multi-second latency on slow links.
 // Most servers don't drop idle TCP for tens of seconds, so we only NOOP after
@@ -110,9 +142,21 @@ export class ImapPool {
       entry.busy = true;
       const idleMs = Date.now() - entry.lastUsed;
       entry.lastUsed = Date.now();
-      if (idleMs < NOOP_FRESHNESS_MS) return entry;
+      // A SELECTed IMAP session sees other sessions' changes (new mail,
+      // expunges, flag changes) only when the server announces them, and some
+      // servers (Stalwart) do so on NOOP but not on SEARCH or FETCH. So once
+      // the IDLE worker or another request has advanced the account's state,
+      // this connection may answer from a view older than the state we have
+      // already advertised: a StateChange says "new mail" and the next
+      // Email/query or Email/get would not show it. NOOP first in that case.
+      // Read the target state BEFORE the NOOP: anything counted in it was
+      // committed on the server before we ask, so the NOOP is sure to see it.
+      const target = mailState(this.store, account.id);
+      const stale = target.email !== entry.synced.email || target.mailbox !== entry.synced.mailbox;
+      if (idleMs < NOOP_FRESHNESS_MS && !stale) return entry;
       try {
         await entry.client.noop();
+        this.markSynced(entry, target);
         return entry;
       } catch {
         // Dead despite looking usable; drop it and keep looking.
@@ -125,10 +169,17 @@ export class ImapPool {
 
     const provider = resolveProvider(this.cfg, account.kind);
     const creds: Credentials = await openCredentials(this.cfg.vaultKey, account.vault);
+    const synced = mailState(this.store, account.id);
     const client = await openImap({ provider, creds });
-    const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true };
+    const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true, synced };
+    this.markSynced(entry, synced);
     this.attach(account, key, entry);
     return entry;
+  }
+
+  private markSynced(entry: PoolEntry, state: MailState): void {
+    entry.synced = state;
+    syncedEmailState.set(entry.client, state.email);
   }
 
   private leaseFor(key: string, entry: PoolEntry): Lease {
@@ -175,7 +226,11 @@ export class ImapPool {
       client.logout().catch(() => {});
       return;
     }
-    this.attach(account, key, { client, lastUsed: Date.now(), busy: false });
+    // The probe has not SELECTed anything yet, so its first SELECT will be
+    // current; the state read now is a safe lower bound for its view.
+    const entry: PoolEntry = { client, lastUsed: Date.now(), busy: false, synced: mailState(this.store, account.id) };
+    this.markSynced(entry, entry.synced);
+    this.attach(account, key, entry);
     this.wake(key);
   }
 

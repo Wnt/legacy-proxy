@@ -1,6 +1,6 @@
 import type { ImapFlow } from "imapflow";
 import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
-import type { ImapPool } from "../../imap/pool.js";
+import { viewEmailState, type ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
 import { fetchEmailsBatch, type JmapEmail } from "../../imap/fetcher.js";
@@ -92,9 +92,16 @@ const FETCH_SORT_PROPS = new Set(["size", "from", "to", "subject", "sentAt", "ha
 //
 // Cache key includes a stable filter hash + uidvalidity so a new mailbox
 // (UIDVALIDITY rolled, e.g. recreate) automatically invalidates entries.
+//
+// The connection's HIGHESTMODSEQ alone is not a safe key: a pooled connection
+// whose view is behind the server reports the old modseq too, and the entry
+// would outlive the IDLE worker's "new mail" StateChange by up to the TTL.
+// So an entry is also stamped with the email state its SEARCH ran at, and
+// only reused while that is still the state the reading connection is at.
 interface SearchCacheEntry {
   uids: number[];
   modseq: number;
+  emailState: number;
   expiresAt: number;
 }
 const searchCache = new Map<string, SearchCacheEntry>();
@@ -146,6 +153,16 @@ function invalidateSearchCacheForAccount(accountId: number): void {
   for (const k of [...searchCache.keys()]) {
     if (k.startsWith(prefix)) searchCache.delete(k);
   }
+}
+
+// The account email state that results read on `client` include: the state
+// the pool last synced the connection to (ImapPool refreshes a connection
+// whenever the state moved), or the current state for a connection from
+// outside the pool. Results stamped with it never claim a newer state than
+// the connection has seen, so a client is never told "you are up to date"
+// with data that misses an advertised change.
+function viewState(ctx: { account: AccountRow; store: Store }, client: ImapFlow): number {
+  return viewEmailState(client) ?? ctx.store.getState(ctx.account.id, "email");
 }
 
 function findInMailbox(filter: Filter): string | null {
@@ -511,11 +528,12 @@ async function emailQuerySingleMailboxFull(
       (status as { uidValidity?: number | bigint } | null)?.uidValidity ?? mboxRow.uidvalidity,
     );
     const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
+    const emailState = viewState(ctx, ctx.client);
 
     const cacheKey = searchCacheKey(ctx.account.id, m.mailboxIdx, uidvalidity, filter);
     let uids: number[] | null = null;
     const cached = searchCache.get(cacheKey);
-    if (cached && cached.modseq === modseq && cached.expiresAt > Date.now()) {
+    if (cached && cached.modseq === modseq && cached.emailState === emailState && cached.expiresAt > Date.now()) {
       uids = cached.uids;
     }
     if (!uids) {
@@ -524,6 +542,7 @@ async function emailQuerySingleMailboxFull(
       searchCache.set(cacheKey, {
         uids,
         modseq,
+        emailState,
         expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
       });
       pruneSearchCache();
@@ -561,11 +580,9 @@ async function emailQuerySingleMailboxFull(
       // the account state to compare against — tying them together lets the
       // "no-change" fast path return an empty diff without recomputing the
       // search server-side. Mailbox-specific staleness still surfaces via
-      // the search cache.
-      queryState: encodeEmailState({
-        uidvalidity: 0,
-        modseq: ctx.store.getState(ctx.account.id, "email"),
-      }),
+      // the search cache. It is the state this connection's view includes
+      // (see viewState), not whatever the counter reads by now.
+      queryState: encodeEmailState({ uidvalidity: 0, modseq: emailState }),
     };
   });
 }
@@ -604,6 +621,9 @@ async function emailQueryAccountWideFull(
     }
   }
 
+  // Folders are scanned on bulk connections leased after this one, so their
+  // views include at least the state this connection is at.
+  const emailState = viewState(ctx, ctx.client);
   const all = await listMailboxes(ctx.client, ctx.account, ctx.store);
   type MboxRow = { id: number; name: string; uidvalidity: number };
   const rows = ctx.store
@@ -643,11 +663,12 @@ async function emailQueryAccountWideFull(
         (status as { uidValidity?: number | bigint } | null)?.uidValidity ?? row.uidvalidity,
       );
       const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
+      const emailState = viewState(ctx, client);
 
       const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
       let uids: number[] | null = null;
       const cached = searchCache.get(cacheKey);
-      if (cached && cached.modseq === modseq && cached.expiresAt > Date.now()) {
+      if (cached && cached.modseq === modseq && cached.emailState === emailState && cached.expiresAt > Date.now()) {
         uids = cached.uids;
       }
       if (!uids) {
@@ -656,6 +677,7 @@ async function emailQueryAccountWideFull(
         searchCache.set(cacheKey, {
           uids,
           modseq,
+          emailState,
           expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
         });
         pruneSearchCache();
@@ -744,7 +766,7 @@ async function emailQueryAccountWideFull(
   );
   return {
     ids: orderedIds,
-    queryState: encodeEmailState({ uidvalidity: 0, modseq: ctx.store.getState(ctx.account.id, "email") }),
+    queryState: encodeEmailState({ uidvalidity: 0, modseq: emailState }),
   };
 }
 
@@ -761,6 +783,8 @@ export async function emailGet(
   ctx: MailCtx,
 ): Promise<{ accountId: string; state: string; list: Record<string, unknown>[]; notFound: string[] }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  // The state these messages are read at; see viewState.
+  const state = encodeEmailState({ uidvalidity: 0, modseq: viewState(ctx, ctx.client) });
   const list: JmapEmail[] = [];
   const notFound: string[] = [];
   // If the client picked an explicit property set, skip the preview FETCH
@@ -846,7 +870,7 @@ export async function emailGet(
   const projected = list.map((e) => projectEmailForGet(e, args.properties));
   return {
     accountId: args.accountId,
-    state: accountEmailState(ctx.store, ctx.account.id),
+    state,
     list: projected,
     notFound,
   };

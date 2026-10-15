@@ -47,13 +47,18 @@ vi.mock("../../src/auth/providers.js", () => ({
   resolveProvider: vi.fn(() => ({ imap: { host: "imap.test", port: 993 } })),
 }));
 
-const { ImapPool } = await import("../../src/imap/pool.js");
+const { ImapPool, viewEmailState } = await import("../../src/imap/pool.js");
 import type { AccountRow, Store } from "../../src/state/store.js";
 import type { AppConfig } from "../../src/util/config.js";
 
 const account = { id: 1, slug: "test:u", kind: "test", vault: Buffer.alloc(0) } as AccountRow;
 const cfg = { vaultKey: Buffer.alloc(32) } as AppConfig;
-const store = {} as Store;
+// Only the state counters the pool reads.
+const states = new Map<string, number>();
+const store = {
+  getState: (_id: number, kind: string) => states.get(kind) ?? 0,
+} as unknown as Store;
+const bump = (kind: string) => states.set(kind, (states.get(kind) ?? 0) + 1);
 
 function makePool() {
   return new ImapPool(cfg, store);
@@ -64,6 +69,7 @@ const settle = () => new Promise((r) => setTimeout(r, 0));
 
 beforeEach(() => {
   opened.length = 0;
+  states.clear();
 });
 
 describe("ImapPool", () => {
@@ -212,5 +218,28 @@ describe("ImapPool", () => {
 
     await pending;
     expect(got).toBe(true);
+  });
+
+  it("refreshes a recently used connection once the account state moved", async () => {
+    // A server may tell a SELECTed session about new mail only on NOOP. Once
+    // the IDLE worker (or another request) advanced the state, the next
+    // borrower must not read through the older view.
+    const pool = makePool();
+    const a = await pool.acquire(account, "interactive");
+    a.release();
+    const fake = a.client as unknown as FakeClient;
+
+    for (const kind of ["email", "mailbox"]) {
+      bump(kind);
+      const b = await pool.acquire(account, "interactive");
+      expect(b.client).toBe(a.client);
+      b.release();
+    }
+    expect(fake.noopCalls).toBe(2);
+    expect(viewEmailState(a.client)).toBe(1);
+
+    // Nothing moved since: no NOOP on a recently used connection.
+    (await pool.acquire(account, "interactive")).release();
+    expect(fake.noopCalls).toBe(2);
   });
 });

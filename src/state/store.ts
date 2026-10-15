@@ -243,6 +243,13 @@ export class Store {
   // can observe.
   private static readonly CHANGE_LOG_LIMIT = 1024;
   private changeLog = new Map<string, ChangeLogEntry[]>();
+  // Highest state per (account, kind) that was bumped WITHOUT a change-log
+  // entry (a plain `bumpState`: an IDLE event the worker could not map to
+  // ids, a submission's Sent copy, ...). No diff across such a state can be
+  // reconstructed, so `entriesSince` must refuse it rather than replay the
+  // entries it does have: answering `created: []` with the newer state tells
+  // the client nothing arrived, and it would never fetch what did.
+  private changeLogGap = new Map<string, number>();
 
   recordChanges(
     accountId: number,
@@ -255,7 +262,7 @@ export class Store {
     if (created.length === 0 && updated.length === 0 && destroyed.length === 0) {
       return this.getState(accountId, kind);
     }
-    const newState = this.bumpState(accountId, kind);
+    const newState = this.advanceState(accountId, kind);
     const key = `${accountId}|${kind}`;
     const buf = this.changeLog.get(key) ?? [];
     for (const id of created) buf.push({ state: newState, action: "created", id });
@@ -263,6 +270,7 @@ export class Store {
     for (const id of destroyed) buf.push({ state: newState, action: "destroyed", id });
     while (buf.length > Store.CHANGE_LOG_LIMIT) buf.shift();
     this.changeLog.set(key, buf);
+    this.stateListener?.(accountId, kind, newState);
     return newState;
   }
 
@@ -274,6 +282,7 @@ export class Store {
     if (sinceState === currentState) return [];
     if (sinceState > currentState) return null;
     const key = `${accountId}|${kind}`;
+    if ((this.changeLogGap.get(key) ?? 0) > sinceState) return null;
     const buf = this.changeLog.get(key);
     if (!buf || buf.length === 0) return null;
     // If the oldest entry's state > sinceState + 1 then we're missing the
@@ -282,7 +291,19 @@ export class Store {
     return buf.filter((e) => e.state > sinceState && e.state <= currentState);
   }
 
+  // Advance a state without saying which ids changed. Every `*/changes`
+  // from an earlier state then answers `cannotCalculateChanges`; callers that
+  // know the ids use `recordChanges` instead.
   bumpState(accountId: number, kind: string): number {
+    const next = this.advanceState(accountId, kind);
+    this.changeLogGap.set(`${accountId}|${kind}`, next);
+    this.stateListener?.(accountId, kind, next);
+    return next;
+  }
+
+  // Persist state + 1. Callers record the log entry or the gap for it first
+  // and then notify, so nobody hears of a state the log can't answer for yet.
+  private advanceState(accountId: number, kind: string): number {
     const row = this.prep(`SELECT state FROM state_log WHERE account_id = ? AND kind = ?`)
       .get(accountId, kind) as { state: number } | undefined;
     const next = (row?.state ?? 0) + 1;
@@ -291,7 +312,6 @@ export class Store {
          ON CONFLICT(account_id, kind) DO UPDATE SET state = excluded.state, at = excluded.at`,
       )
       .run(accountId, kind, next, Date.now());
-    this.stateListener?.(accountId, kind, next);
     return next;
   }
 

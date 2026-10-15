@@ -19,6 +19,7 @@ import { openImap } from "../imap/client.js";
 import type { Store, AccountRow } from "../state/store.js";
 import type { AppConfig } from "../util/config.js";
 import { log } from "../util/log.js";
+import { encodeEmailId } from "../mapping/ids.js";
 
 // Reconnect backoff. Most disconnects are transient (mid-air NAT timeout,
 // server restart), so start aggressive; cap so we don't hammer a server
@@ -39,6 +40,14 @@ interface Worker {
   reconnectTimer: NodeJS.Timeout | null;
   refreshTimer: NodeJS.Timeout | null;
   backoffMs: number;
+  // INBOX UIDs this worker has reported, ascending (= sequence order). Kept
+  // across reconnects so the next connection can report what changed while
+  // the socket was down. Null until the first connection has listed INBOX.
+  inbox: { uidValidity: number; uids: number[] } | null;
+  // Events whose diff is still being computed. They run one at a time, in
+  // arrival order, on `queue`.
+  pending: number;
+  queue: Promise<void>;
 }
 
 export class PushIdleManager {
@@ -90,6 +99,9 @@ export class PushIdleManager {
       reconnectTimer: null,
       refreshTimer: null,
       backoffMs: RECONNECT_MIN_MS,
+      inbox: null,
+      pending: 0,
+      queue: Promise.resolve(),
     };
     this.workers.set(accountId, worker);
     this.connect(account, worker).catch((err) => {
@@ -119,36 +131,49 @@ export class PushIdleManager {
     const creds: Credentials = await openCredentials(this.cfg.vaultKey, account.vault);
     const client = await openImap({ provider, creds });
 
+    // Every event below becomes a change-log entry naming the ids, so
+    // Email/changes from the previous state lists exactly what arrived or
+    // vanished. Where the ids cannot be known, the state is bumped as a gap
+    // (Store.bumpState) and Email/changes answers cannotCalculateChanges:
+    // never an empty `created` with a newer state.
+    //
     // imapflow's `'exists'` event tells us the post-mutation count + the
-    // previous count. A higher count is a true new arrival; equal/lower
-    // happens on EXPUNGE-driven renumbering and is covered by the expunge
-    // handler instead.
+    // previous count. A higher count is a new arrival; equal/lower happens on
+    // EXPUNGE-driven renumbering and is covered by the expunge handler.
     client.on("exists", (ev: { count: number; prevCount: number }) => {
       if (ev.count > ev.prevCount) {
-        // New mail arrived. Bump the dedicated counter that the webmail's
-        // PushSubscription only opts in to, plus the broader Email/Mailbox
-        // counters so SSE-listening tabs refresh right away.
-        this.store.bumpState(account.id, "email_delivery");
-        this.store.bumpState(account.id, "email");
-        this.store.bumpState(account.id, "mailbox");
+        this.enqueue(account, worker, client, "arrival");
       } else {
-        // EXISTS that didn't grow shouldn't drive a notification, but it
-        // does mean the count moved — bump mailbox so cached counts refresh.
+        // The count moved without new mail; bump mailbox so cached counts refresh.
         this.store.bumpState(account.id, "mailbox");
       }
     });
 
     client.on("expunge", () => {
       // Deletes don't deserve a system notification but they do invalidate
-      // any in-memory Email/Mailbox state on connected clients.
-      this.store.bumpState(account.id, "email");
-      this.store.bumpState(account.id, "mailbox");
+      // any in-memory Email/Mailbox state on connected clients. EXPUNGE only
+      // carries a sequence number, so re-list INBOX and diff.
+      this.enqueue(account, worker, client, "full");
     });
 
-    client.on("flags", () => {
+    client.on("flags", (ev: { seq: number; uid?: number }) => {
       // Read/Flagged toggles from another device land here. No EmailDelivery
-      // bump (no new mail), but Email state moved.
-      this.store.bumpState(account.id, "email");
+      // bump (no new mail), but Email state moved. The sequence number maps
+      // to a UID only while our list is in step with the server's view.
+      const inbox = worker.inbox;
+      const inStep =
+        inbox !== null &&
+        worker.client === client &&
+        worker.pending === 0 &&
+        inbox.uids.length === (client.mailbox ? client.mailbox.exists : -1);
+      const uid = ev.uid ?? (inStep ? inbox.uids[ev.seq - 1] : undefined);
+      if (inbox && uid !== undefined) {
+        this.store.recordChanges(account.id, "email", {
+          updated: [this.emailId(account.id, inbox.uidValidity, uid)],
+        });
+      } else {
+        this.store.bumpState(account.id, "email");
+      }
     });
 
     client.on("close", () => {
@@ -167,6 +192,22 @@ export class PushIdleManager {
     // interrupted by a mid-flight FETCH on this socket.
     await client.mailboxOpen("INBOX");
 
+    // Learn INBOX's UIDs. On a reconnect, report what changed while the
+    // socket was down as a diff against the list we had. On the first
+    // connection (or a new UIDVALIDITY) nobody was watching before, so the
+    // state jumps as a gap: Email/changes from any earlier state must not
+    // pretend it knows what arrived meanwhile.
+    const uidValidity = client.mailbox ? Number(client.mailbox.uidValidity) : 0;
+    const uids = await searchUids(client, { all: true });
+    const prev = worker.inbox;
+    worker.inbox = { uidValidity, uids };
+    if (prev && prev.uidValidity === uidValidity) {
+      this.recordDiff(account, prev.uids, uids, uidValidity);
+    } else {
+      this.store.bumpState(account.id, "email");
+      this.store.bumpState(account.id, "mailbox");
+    }
+
     worker.client = client;
     worker.backoffMs = RECONNECT_MIN_MS;
     log.info({ accountId: account.id, host: provider.imap.host }, "idle: connected");
@@ -175,6 +216,84 @@ export class PushIdleManager {
     // connection is otherwise quiet, but we explicitly cycle it before the
     // RFC 2177 30-minute server-side timeout would kill us.
     this.scheduleIdleRefresh(account, worker);
+  }
+
+  // Run diffs one at a time in event order: each one reads and replaces
+  // worker.inbox.
+  private enqueue(account: AccountRow, worker: Worker, client: ImapFlow, kind: "arrival" | "full"): void {
+    worker.pending++;
+    worker.queue = worker.queue
+      .then(() => this.syncInbox(account, worker, client, kind))
+      .finally(() => {
+        worker.pending--;
+      });
+  }
+
+  // Bring worker.inbox in step with the server and record the difference.
+  // "arrival" only asks for UIDs above the highest known one (new mail always
+  // gets a higher UID); "full" re-lists INBOX, which an expunge needs.
+  private async syncInbox(
+    account: AccountRow,
+    worker: Worker,
+    client: ImapFlow,
+    kind: "arrival" | "full",
+  ): Promise<void> {
+    const inbox = worker.inbox;
+    if (worker.client !== client || !inbox) return; // superseded by a reconnect
+    try {
+      let now: number[];
+      if (kind === "arrival") {
+        const max = inbox.uids.length > 0 ? inbox.uids[inbox.uids.length - 1]! : 0;
+        // `n:*` always includes the highest UID, even when it is below n.
+        const above = (await searchUids(client, { uid: `${max + 1}:*` })).filter((u) => u > max);
+        now = inbox.uids.concat(above);
+      } else {
+        now = await searchUids(client, { all: true });
+      }
+      worker.inbox = { uidValidity: inbox.uidValidity, uids: now };
+      this.recordDiff(account, inbox.uids, now, inbox.uidValidity);
+    } catch (err) {
+      // We can't name the ids: announce the change as a gap, and forget the
+      // list so the reconnect this error usually precedes starts over.
+      log.warn({ accountId: account.id, err: (err as Error).message }, "idle: inbox sync failed");
+      worker.inbox = null;
+      this.store.bumpState(account.id, "email");
+      if (kind === "arrival") this.store.bumpState(account.id, "email_delivery");
+      this.store.bumpState(account.id, "mailbox");
+    }
+  }
+
+  // Record created/destroyed ids between two UID lists. The email state moves
+  // (with its log entry) BEFORE email_delivery, so by the time anyone hears
+  // "new mail" Email/changes can name it, and the request path's pooled
+  // connections see a newer state and refresh their view (ImapPool).
+  private recordDiff(account: AccountRow, before: number[], after: number[], uidValidity: number): void {
+    const was = new Set(before);
+    const is = new Set(after);
+    const created = after.filter((u) => !was.has(u)).map((u) => this.emailId(account.id, uidValidity, u));
+    const destroyed = before.filter((u) => !is.has(u)).map((u) => this.emailId(account.id, uidValidity, u));
+    if (created.length === 0 && destroyed.length === 0) return;
+    this.store.recordChanges(account.id, "email", { created, destroyed });
+    // New arrivals bump the counter the webmail's PushSubscription opts in
+    // to; mailbox counts moved either way.
+    if (created.length > 0) this.store.bumpState(account.id, "email_delivery");
+    this.store.bumpState(account.id, "mailbox");
+  }
+
+  // Ids must match what Email/query and Email/get produce for INBOX, so use
+  // INBOX's mailbox row (created here if no Mailbox/get has listed it yet;
+  // listMailboxes upserts the same row by name).
+  private emailId(accountId: number, uidValidity: number, uid: number): string {
+    this.store
+      .prep(
+        `INSERT INTO mailbox(account_id, name, role, subscribed) VALUES(?, 'INBOX', 'inbox', 1)
+         ON CONFLICT(account_id, name) DO NOTHING`,
+      )
+      .run(accountId);
+    const row = this.store
+      .prep(`SELECT id FROM mailbox WHERE account_id = ? AND name = 'INBOX'`)
+      .get(accountId) as { id: number };
+    return encodeEmailId({ accountIdx: accountId, mailboxIdx: row.id, uidvalidity: uidValidity, uid });
   }
 
   private scheduleIdleRefresh(account: AccountRow, worker: Worker): void {
@@ -206,4 +325,9 @@ export class PushIdleManager {
       });
     }, delay);
   }
+}
+
+async function searchUids(client: ImapFlow, query: Record<string, unknown>): Promise<number[]> {
+  const found = await client.search(query, { uid: true });
+  return Array.isArray(found) ? [...found].sort((a, b) => a - b) : [];
 }
