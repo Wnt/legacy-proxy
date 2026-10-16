@@ -52,10 +52,11 @@ Changes from upstream:
   - *Email/set create is schema-checked.* nodemailer's `MimeNode` reads a
     local file for a `{ path }` body, fetches a `{ href }` body and writes a
     `{ prepared: true }` header value unencoded. `src/mapping/emailCreate.ts`
-    checks every property's JMAP type (bodies, headers, addresses, ids, dates,
-    the body structure with depth and part limits) before blob lookup or MIME
-    building, and answers `invalidProperties`. Unknown non-`header:*`
-    properties are refused too. Every `MimeNode` is built with
+    checks the JMAP type of every property the proxy reads (bodies, headers,
+    `header:*` forms, addresses, ids, RFC 3339 dates, the body structure with
+    16-level and 256-part limits) before blob lookup or MIME building, and
+    answers `invalidProperties`. Unknown non-`header:*` properties are refused
+    too; server-set ones (`id`, `size`, …) are still accepted and ignored. Every `MimeNode` is built with
     `disableFileAccess` and `disableUrlAccess`, content must be a string or
     Buffer, and the SMTP transport disables both as well.
   - *Header parsing is linear and bounded.* `asMessageIds`, `asURLs` and the
@@ -63,10 +64,20 @@ Changes from upstream:
     `<`; a sender could stall the event loop for seconds with a References
     header of `<`s, on every listing and push lookup. They now use linear
     scanners with the same results (fuzz-tested against the old regexes).
-    Header blocks are parsed and cached up to 512 KiB, each unfolded field up
-    to 128 KiB, and message ids holding a stray `<` or longer than 998
-    characters are skipped, so threading falls back to the next reference or
-    the message's own id. Code: `src/imap/headers.ts`, `src/imap/fetcher.ts`.
+    Header blocks are bounded on the wire: a message larger than 512 KiB gets
+    its header as the partial `BODY.PEEK[HEADER]<0.524288>` (cut down to the
+    threading fields when only those are needed); a smaller one can't have a
+    larger header and keeps the cheap `HEADER.FIELDS` fetch. This costs one
+    extra FETCH round trip for uncached messages. Email/get and the
+    thread-index scan share this fetch, so a message's threadId comes from
+    the same bytes on every path. Each unfolded field is parsed up to
+    128 KiB; message ids holding a stray `<` or longer than 998 characters
+    are skipped, so threading falls back to the next reference or the
+    message's own id. Cached header blocks over the bound are dropped at
+    startup and refetched. imapflow's literal/response limits are lowered
+    from 1/2 GiB to 128/160 MiB as a backstop. Code: `src/imap/headers.ts`,
+    `src/imap/fetcher.ts`, `src/jmap/methods/threads.ts`,
+    `src/imap/client.ts`, `src/state/store.ts`.
 
   Tests: `test/unit/security-*.spec.ts` and `test/unit/contacts-set.spec.ts`.
 

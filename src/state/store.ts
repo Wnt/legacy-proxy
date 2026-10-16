@@ -1,6 +1,7 @@
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { Database as DB, Statement } from "better-sqlite3";
+import { MAX_HEADER_BLOCK_BYTES } from "../imap/headers.js";
 
 export interface AccountRow {
   id: number;
@@ -193,6 +194,12 @@ export class Store {
   constructor(dataDir: string) {
     this.db = new Database(path.join(dataDir, "proxy.db"));
     this.db.exec(SCHEMA);
+    // Header blocks cached before fetches were bounded can exceed what a
+    // fetch returns now. Drop them (the row stays; its headers are refetched,
+    // bounded, on next use) so they are never loaded whole again.
+    this.db
+      .prepare(`UPDATE email_cache SET headers_raw = NULL, headers_full = 0 WHERE length(headers_raw) > ?`)
+      .run(MAX_HEADER_BLOCK_BYTES);
   }
 
   /** Prepared statement for `sql`, compiled once and cached. */

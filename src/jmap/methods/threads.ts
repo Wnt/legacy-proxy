@@ -8,7 +8,7 @@
 // The steady state — nothing changed — costs one LIST and zero SELECTs; the
 // full-account header scan happens exactly once per account lifetime.
 
-import type { ImapFlow } from "imapflow";
+import type { FetchMessageObject, ImapFlow } from "imapflow";
 import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
 import type { ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeEmailId } from "../../mapping/ids.js";
@@ -18,7 +18,7 @@ import { withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { listMailboxes, liveMailboxStatus, type LiveMailboxStatus } from "./mailbox.js";
 import { parseHeaderBlock, computeThreadIdFromHeaders } from "../../imap/headers.js";
-import { THREAD_HEADER_FIELDS } from "../../imap/fetcher.js";
+import { fetchHeadersBounded } from "../../imap/fetcher.js";
 import { log } from "../../util/log.js";
 import { type ChangesResponse } from "./_shared.js";
 
@@ -73,6 +73,13 @@ export function sameAsLastScan(
 
 // Bring the email_cache rows for one folder up to date with the live mailbox.
 // Assumes the mailbox is already SELECTed on `client`.
+// The threading fields of each message, fetched with the same bound (and so
+// the same bytes) as Email/get's, so both compute the same threadId.
+function boundedThreadHeaders(client: ImapFlow, metas: FetchMessageObject[]): Promise<Map<number, Buffer>> {
+  const sizes = new Map(metas.map((m) => [m.uid!, m.size]));
+  return fetchHeadersBounded(client, [...sizes.keys()], (uid) => sizes.get(uid), false);
+}
+
 async function syncMailboxScan(
   client: ImapFlow,
   account: AccountRow,
@@ -100,17 +107,21 @@ async function syncMailboxScan(
 
   if (exists > 0 && uidNext > startUid) {
     const upserts: EmailCacheUpsert[] = [];
+    const metas: FetchMessageObject[] = [];
     for await (const msg of client.fetch(
       `${startUid}:*`,
-      { uid: true, envelope: true, internalDate: true, headers: THREAD_HEADER_FIELDS },
+      { uid: true, envelope: true, internalDate: true, size: true },
       { uid: true },
     )) {
       // `${x}:*` returns the highest-UID message even when x exceeds it. A
       // FLAGS-only FETCH pushed mid-command has no envelope: not ours.
       if (msg.uid == null || msg.uid < startUid || !msg.envelope) continue;
-      const hb =
-        typeof msg.headers === "string" || Buffer.isBuffer(msg.headers) ? msg.headers : "";
-      const headers = parseHeaderBlock(hb);
+      metas.push(msg);
+    }
+    const blocks = await boundedThreadHeaders(client, metas);
+    for (const msg of metas) {
+      if (msg.uid == null) continue;
+      const headers = parseHeaderBlock(blocks.get(msg.uid) ?? "");
       const env = msg.envelope as { messageId?: string } | undefined;
       const tid =
         computeThreadIdFromHeaders(headers, env?.messageId ?? null) ??
@@ -139,15 +150,19 @@ async function syncMailboxScan(
     const gaps = [...live].filter((uid) => !cachedSet.has(uid));
     if (gaps.length > 0) {
       const upserts: EmailCacheUpsert[] = [];
+      const metas: FetchMessageObject[] = [];
       for await (const msg of fetchByUid(
         client,
         gaps,
-        { uid: true, envelope: true, internalDate: true, headers: THREAD_HEADER_FIELDS },
+        { uid: true, envelope: true, internalDate: true, size: true },
       )) {
         if (msg.uid == null || !msg.envelope) continue;
-        const hb =
-          typeof msg.headers === "string" || Buffer.isBuffer(msg.headers) ? msg.headers : "";
-        const headers = parseHeaderBlock(hb);
+        metas.push(msg);
+      }
+      const blocks = await boundedThreadHeaders(client, metas);
+      for (const msg of metas) {
+        if (msg.uid == null) continue;
+        const headers = parseHeaderBlock(blocks.get(msg.uid) ?? "");
         const env = msg.envelope as { messageId?: string } | undefined;
         const tid =
           computeThreadIdFromHeaders(headers, env?.messageId ?? null) ??

@@ -14,7 +14,8 @@ export class InvalidEmailCreateError extends Error {
 }
 
 // RFC 8621 §4.1 Email properties. The server-set ones (id, blobId, threadId,
-// size, hasAttachment, preview) are accepted and ignored, as before.
+// size, hasAttachment, preview) are accepted and ignored, as before; nothing
+// reads them, so their values are not checked.
 const EMAIL_PROPERTIES = new Set([
   "id", "blobId", "threadId", "mailboxIds", "keywords", "size", "receivedAt",
   "messageId", "inReplyTo", "references", "sender", "from", "to", "cc", "bcc",
@@ -41,10 +42,13 @@ function optString(o: Obj, key: string, prop: string): void {
   if (v !== undefined && v !== null && typeof v !== "string") fail(prop, `${key} must be a string`);
 }
 
+// RFC 8620 §1.4 Date / UTCDate: RFC 3339 date-time.
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/i;
+
 function optDate(o: Obj, key: string): void {
   optString(o, key, key);
   const v = o[key];
-  if (typeof v === "string" && Number.isNaN(Date.parse(v))) fail(key, "must be a date");
+  if (typeof v === "string" && (!RFC3339.test(v) || Number.isNaN(Date.parse(v)))) fail(key, "must be an RFC 3339 date");
 }
 
 function optStringList(o: Obj, key: string): void {

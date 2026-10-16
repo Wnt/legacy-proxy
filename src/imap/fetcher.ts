@@ -25,16 +25,72 @@ import { log } from "../util/log.js";
 // `header:*` projection, so we only pull the full block on demand.
 export const THREAD_HEADER_FIELDS = ["message-id", "in-reply-to", "references"];
 
-function metaQuery(fullHeaders: boolean) {
-  return {
-    uid: true as const,
-    flags: true as const,
-    size: true as const,
-    internalDate: true as const,
-    envelope: true as const,
-    bodyStructure: true as const,
-    headers: fullHeaders ? (true as const) : THREAD_HEADER_FIELDS,
-  };
+// Everything but the header block, which fetchHeadersBounded() gets once the
+// sizes are known.
+const META_QUERY = {
+  uid: true as const,
+  flags: true as const,
+  size: true as const,
+  internalDate: true as const,
+  envelope: true as const,
+  bodyStructure: true as const,
+};
+
+/**
+ * Header blocks for `uids`, never more than MAX_HEADER_BLOCK_BYTES of them per
+ * message on the wire: the server, and so any sender, decides how large a
+ * header block is, and imapflow buffers a whole literal before we see it.
+ *
+ * IMAP can't bound a HEADER.FIELDS fetch through imapflow, but a message's
+ * header can't be larger than the message. So a message whose RFC822.SIZE is
+ * within the bound (nearly all mail without large attachments) keeps the cheap
+ * fetch: HEADER.FIELDS for the threading fields, or HEADER. A larger one (or one
+ * of unknown size) is fetched as the partial BODY.PEEK[HEADER]<0.N> and, when
+ * only the threading fields were asked for, reduced to them.
+ *
+ * Either way a message's threading fields come from the same bytes whether
+ * the full block or only the fields were requested, so its threadId does not
+ * depend on which projection fetched it first.
+ */
+export async function fetchHeadersBounded(
+  client: ImapFlow,
+  uids: number[],
+  sizeOf: (uid: number) => number | undefined,
+  full: boolean,
+): Promise<Map<number, Buffer>> {
+  const out = new Map<number, Buffer>();
+  const small: number[] = [];
+  const large: number[] = [];
+  for (const uid of uids) {
+    const size = sizeOf(uid);
+    (size != null && size <= MAX_HEADER_BLOCK_BYTES ? small : large).push(uid);
+  }
+  if (small.length > 0) {
+    const query = { uid: true as const, headers: full ? (true as const) : THREAD_HEADER_FIELDS };
+    for await (const m of fetchByUid(client, small, query)) {
+      // A FLAGS-only FETCH pushed mid-command carries no header block.
+      if (m.uid == null || m.headers == null) continue;
+      out.set(m.uid, headersToBuffer(m.headers));
+    }
+  }
+  if (large.length > 0) {
+    const query = { uid: true as const, bodyParts: [{ key: "HEADER", start: 0, maxLength: MAX_HEADER_BLOCK_BYTES }] };
+    for await (const m of fetchByUid(client, large, query)) {
+      if (m.uid == null || m.headers == null) continue;
+      const block = headersToBuffer(m.headers);
+      out.set(m.uid, full ? block : threadFieldsOnly(block));
+    }
+  }
+  return out;
+}
+
+/** Just the THREAD_HEADER_FIELDS of a header block, unfolded. */
+function threadFieldsOnly(block: Buffer): Buffer {
+  const wanted = new Set(THREAD_HEADER_FIELDS);
+  const lines = parseHeaderBlock(block)
+    .filter((h) => wanted.has(h.name.toLowerCase()))
+    .map((h) => `${h.name}: ${h.rawValue}\r\n`);
+  return Buffer.from(lines.join("") + "\r\n", "utf8");
 }
 
 export interface JmapEmail {
@@ -203,7 +259,7 @@ function headersToBuffer(headers: FetchMessageObject["headers"]): Buffer {
   return buf.length > MAX_HEADER_BLOCK_BYTES ? Buffer.from(buf.subarray(0, MAX_HEADER_BLOCK_BYTES)) : buf;
 }
 
-function rawFromFetch(msg: FetchMessageObject, headersFull: boolean): RawMeta {
+function rawFromFetch(msg: FetchMessageObject, headersRaw: Buffer, headersFull: boolean): RawMeta {
   return {
     uid: msg.uid!,
     flags: new Set(msg.flags ?? []),
@@ -211,7 +267,7 @@ function rawFromFetch(msg: FetchMessageObject, headersFull: boolean): RawMeta {
     internaldate: msg.internalDate ? new Date(msg.internalDate).getTime() : Date.now(),
     envelope: (msg.envelope as EnvelopeLike | undefined) ?? null,
     bodystructure: msg.bodyStructure ?? null,
-    headersRaw: headersToBuffer(msg.headers),
+    headersRaw,
     headersFull,
     preview: null,
     fromCache: false,
@@ -469,7 +525,9 @@ export async function fetchEmailsBatch(
           internaldate: row.internaldate,
           envelope,
           bodystructure,
-          headersRaw: Buffer.isBuffer(row.headers_raw) ? row.headers_raw : Buffer.from(row.headers_raw),
+          // Rows cached before the header bound can be larger; parse only
+          // what a fresh fetch would have returned.
+          headersRaw: headersToBuffer(row.headers_raw),
           headersFull: row.headers_full === 1,
           preview: row.preview,
           fromCache: true,
@@ -483,12 +541,22 @@ export async function fetchEmailsBatch(
   }
 
   if (missing.length > 0) {
-    for await (const m of fetchByUid(client, missing, metaQuery(needsFull))) {
+    const fetchedMeta = new Map<number, FetchMessageObject>();
+    for await (const m of fetchByUid(client, missing, META_QUERY)) {
       // imapflow hands back every untagged FETCH that arrives during the
       // command, including the FLAGS-only ones a server pushes when another
       // session changes flags. Those carry no structure; keep the real answer.
       if (m.uid == null || !m.bodyStructure || !m.envelope) continue;
-      raws.set(m.uid, rawFromFetch(m, needsFull));
+      fetchedMeta.set(m.uid, m);
+    }
+    const headers = await fetchHeadersBounded(
+      client,
+      [...fetchedMeta.keys()],
+      (uid) => fetchedMeta.get(uid)?.size,
+      needsFull,
+    );
+    for (const [uid, m] of fetchedMeta) {
+      raws.set(uid, rawFromFetch(m, headers.get(uid) ?? Buffer.alloc(0), needsFull));
     }
   }
 

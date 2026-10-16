@@ -8,6 +8,10 @@ export interface ImapConnOpts {
   creds: Credentials;
 }
 
+// Above the largest message this proxy sends or stores (50 MB of attachments,
+// base64-encoded).
+const MAX_IMAP_LITERAL_BYTES = 128 * 1024 * 1024;
+
 export async function openImap(opts: ImapConnOpts): Promise<ImapFlow> {
   const { provider, creds } = opts;
   let auth: { user: string; pass?: string; accessToken?: string };
@@ -24,6 +28,14 @@ export async function openImap(opts: ImapConnOpts): Promise<ImapFlow> {
     secure: provider.imap.secure ?? true,
     auth,
     logger: imapflowLogger,
+    // Backstops on what one server response may make imapflow buffer (its
+    // defaults are 1 GiB per literal, 2 GiB per response), above anything a
+    // legitimate fetch returns: header blocks use partial fetches, downloads
+    // come in 64 KiB chunks, and a whole message is only read for submission.
+    // Exceeding one closes the connection.
+    maxLiteralSize: MAX_IMAP_LITERAL_BYTES,
+    maxResponseSize: MAX_IMAP_LITERAL_BYTES + 32 * 1024 * 1024,
+    maxLineLength: 16 * 1024 * 1024,
   });
   // imapflow reports a socket timeout or reset as an 'error' event, and an
   // EventEmitter with no listener throws it from a timer: an uncaught

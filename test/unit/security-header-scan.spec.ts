@@ -16,6 +16,11 @@ import {
   splitAngleAddr,
 } from "../../src/imap/headers.js";
 
+// The old regexes take ~1.5 s on 12 KB and grow quadratically (minutes at
+// these sizes); the linear scanners take tens of ms. The budget leaves room
+// for a loaded test machine.
+const BUDGET_MS = 1000;
+
 function legacyBracketed(v: string): string[] {
   const out: string[] = [];
   const re = /<([^>]+)>/g;
@@ -68,7 +73,7 @@ describe("linear header scanners", () => {
     asMessageIds(headers, "References");
     asURLs(headers, "List-Unsubscribe");
     const tid = computeThreadIdFromHeaders(headers, null);
-    expect(performance.now() - t).toBeLessThan(250);
+    expect(performance.now() - t).toBeLessThan(BUDGET_MS);
     expect(tid).toBe(computeThreadIdFromHeaders(parseHeaderBlock("Message-ID: <own@x>\r\n\r\n"), null));
   });
 
@@ -76,7 +81,7 @@ describe("linear header scanners", () => {
     const t = performance.now();
     parseAddressList(value.slice(0, MAX_HEADER_FIELD_CHARS));
     parseAddressList(`Name ${value.slice(0, MAX_HEADER_FIELD_CHARS)}>`);
-    expect(performance.now() - t).toBeLessThan(250);
+    expect(performance.now() - t).toBeLessThan(BUDGET_MS);
   });
 });
 
@@ -97,9 +102,10 @@ describe("malformed threading data", () => {
 
 describe("header size bounds", () => {
   it("caps one unfolded field", () => {
-    const folded = Array.from({ length: 4000 }, (_, i) => `<id${i}@example.test>`).join("\r\n ");
+    const folded = Array.from({ length: 8000 }, (_, i) => `<id${i}@example.test>`).join("\r\n ");
+    expect(folded.length).toBeGreaterThan(MAX_HEADER_FIELD_CHARS);
     const [h] = parseHeaderBlock(`References: ${folded}\r\n\r\n`);
-    expect(h!.rawValue.length).toBeLessThanOrEqual(MAX_HEADER_FIELD_CHARS);
+    expect(h!.rawValue.length).toBe(MAX_HEADER_FIELD_CHARS);
     // The start of the chain (the thread root) survives truncation.
     expect(asMessageIds([h!], "References")![0]).toBe("id0@example.test");
   });
