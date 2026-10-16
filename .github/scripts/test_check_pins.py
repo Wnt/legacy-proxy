@@ -70,6 +70,18 @@ class DockerfileTests(unittest.TestCase):
                     "RUN npm run install-deps"):
             self.assertEqual(check_dockerfile(f"FROM n@{D}\n{run}\n"), [], run)
 
+    def test_npm_install_shell_tricks(self):
+        for run in ("RUN npm inst\\all", 'RUN npm "inst"all', "RUN --network=none npm install",
+                    'RUN ["npm", "inst', "RUN [\"sh\", \"-c\", \"npm install\"]"):
+            self.assertEqual(len(check_dockerfile(f"FROM n@{D}\n{run}\n")), 1, run)
+
+    def test_comment_inside_continuation(self):
+        for body in ("RUN true \\\n# install dependencies\n && npm install",
+                     "COPY \\\n# helper image\n --from=busybox:latest /bin/sh /sh",
+                     "COPY \\\n\n --from=busybox:latest /bin/sh /sh"):
+            self.assertEqual(len(check_dockerfile(f"FROM n@{D}\n{body}\n")), 1, body)
+        self.assertEqual(check_dockerfile(f"FROM n@{D}\nRUN true \\\n# c\n && npm ci\n"), [])
+
     def test_escape_directive_refused(self):
         text = f"# escape=`\nFROM node:24@{D}\nRUN echo \\\nFROM node:24\n"
         self.assertTrue(check_dockerfile(text))
@@ -91,6 +103,11 @@ class DockerfileTests(unittest.TestCase):
         for line in good:
             self.assertEqual(check_dockerfile(f"FROM n@{D} AS build\n{line}\n"), [], line)
 
+    def test_add_exec_form(self):
+        self.assertEqual(len(check_dockerfile(f'FROM n@{D}\nADD ["https://x/p.tgz", "/app/"]\n')), 1)
+        self.assertEqual(check_dockerfile(f'FROM n@{D}\nADD ["local.tgz", "/app/"]\n'), [])
+        self.assertEqual(len(check_dockerfile(f'FROM n@{D}\nADD ["broken\n')), 1)
+
     def test_add_remote(self):
         self.assertEqual(len(check_dockerfile(f"FROM n@{D}\nADD https://x/y.tgz /y\n")), 1)
         self.assertEqual(len(check_dockerfile(f"FROM n@{D}\nADD git@github.com:o/r.git /r\n")), 1)
@@ -101,13 +118,32 @@ class DockerfileTests(unittest.TestCase):
 class ShellTests(unittest.TestCase):
     def test_image_assignments(self):
         bad = ('PW_IMAGE="mcr.microsoft.com/playwright:v1.59.1-noble"', "export IMAGE=node:24",
-               "image='ghcr.io/o/r:latest'", 'PW_IMAGE="x/y@sha256:abc"')
+               "image='ghcr.io/o/r:latest'", 'PW_IMAGE="x/y@sha256:abc"',
+               'PW_IMAGE="mcr.microsoft.com/playwright"', "IMAGE=localhost:5000/o/r", 'IMAGE="$BASE"')
         for line in bad:
             self.assertEqual(len(check_shell(line + "\n")), 1, line)
-        good = (f'PW_IMAGE="mcr.microsoft.com/playwright:v1.59.1-noble@{D}"', "IMAGE=ghcr.io/o/r",
-                "IMAGE=localhost:5000/o/r", "echo IMAGE=x:y")
+        good = (f'PW_IMAGE="mcr.microsoft.com/playwright:v1.59.1-noble@{D}"',
+                "IMAGE=ghcr.io/o/r  # pin-check: repository (tag appended at use)",
+                "echo IMAGE=x:y", "IMAGE=")
         for line in good:
             self.assertEqual(check_shell(line + "\n"), [], line)
+
+    def test_declarations_and_other_assignments(self):
+        bad = ('declare -r PW_IMAGE="mcr.microsoft.com/playwright"', "typeset -x IMAGE=node:24",
+               "readonly -a X_IMAGE=node", 'PW_IMAGE+=":latest"', "printf -v PW_IMAGE '%s' node",
+               "read -r PW_IMAGE < f")
+        for line in bad:
+            self.assertEqual(len(check_shell(line + "\n")), 1, line)
+        self.assertEqual(check_shell(f'declare -r PW_IMAGE="x/y:1@{D}"\n'), [])
+        self.assertEqual(check_shell('docker run "$PW_IMAGE" true\n'), [])
+        self.assertEqual(len(check_shell('cd x; PW_IMAGE=node:24\n')), 1)
+
+    def test_npm_install_in_scripts(self):
+        for body in ("(cd x && npm install --loglevel=warn) &", "npm --ignore-scripts install",
+                     "npm \\\n  install"):
+            self.assertEqual(len(check_shell(body + "\n")), 1, body)
+        for body in ("npm ci --loglevel=warn", "# npm install", 'echo "npm ci + npm run build"'):
+            self.assertEqual(check_shell(body + "\n"), [], body)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -143,6 +179,42 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(len(check_workflow(f"    container:\n      image: {v}\n")), 1, v)
         for v in (f"node:24@{D}", f"docker://alpine:3@{D}", "Dockerfile", "./docker/Dockerfile", ""):
             self.assertEqual(check_workflow(f"    image: {v}\n"), [], v)
+
+    def test_container_shorthand_and_flow_mappings(self):
+        for line in ("    container: node:22", "    db: {image: redis:latest}",
+                     "    services: { db: { image: 'redis:7' } }", "    container: ${{ matrix.c }}"):
+            self.assertEqual(len(check_workflow(line + "\n")), 1, line)
+        for line in ("    container:", f"    container: node:22@{D}", f"    db: {{image: redis:7@{D}}}",
+                     "    container: # comment"):
+            self.assertEqual(check_workflow(line + "\n"), [], line)
+
+    def test_multiline_run_blocks(self):
+        for body in ("- run: |\n    npm \\\n      install\n", "- run: >-\n    npm\n    install\n",
+                     "- name: x\n  run: |\n    echo hi\n    npm i\n"):
+            self.assertTrue(check_workflow(body), body)
+        for body in ("- run: |\n    npm ci\n    npx playwright install\n",
+                     "- run: |\n    npm ci\n    echo install\n", "- run: >-\n    npm\n    ci\n"):
+            self.assertEqual(check_workflow(body), [], body)
+
+    def test_docker_action_remote_tag_named_dockerfile(self):
+        self.assertEqual(len(check_workflow("  image: docker://alpine:Dockerfile\n")), 1)
+        self.assertEqual(len(check_workflow("runs: {using: docker, image: 'docker://alpine:latest'}\n")), 1)
+
+    def test_multiline_image_values(self):
+        bad = ("    container:\n      image: >-\n        node:24\n",
+               "    container:\n      image:\n        node:24\n",
+               "    container:\n      image: |\n        node:24\n",
+               "    container: >-\n      node:24\n",
+               '    image: "node:\n      24"\n', "    image: &img node:24\n", "    image: *img\n")
+        for body in bad:
+            self.assertTrue(check_workflow(body), body)
+        good = (f"    container:\n      image: >-\n        node:24@{D}\n",
+                f"    container:\n      image:\n        node:24@{D}\n",
+                f"    container:\n      image: node:24@{D}\n      options: --user 1001\n",
+                f"    services:\n      db:\n        image: redis:7@{D}\n",
+                "jobs:\n  image:\n    needs: test\n    runs-on: ubuntu-latest\n")
+        for body in good:
+            self.assertEqual(check_workflow(body), [], body)
 
     def test_local_action_must_exist(self):
         self.assertEqual(len(check_workflow("  - uses: ./missing\n", lambda ref: False)), 1)

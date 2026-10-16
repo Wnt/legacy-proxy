@@ -15,13 +15,17 @@
 - Dockerfile RUN lines and workflow lines must not run `npm install` (or its
   aliases), with or without npm options in between; use `npm ci`, which
   installs exactly the lockfile.
-- Shell scripts (*.sh): an `IMAGE=` / `*_IMAGE=` assignment whose value carries
-  a tag must also carry a digest.
+- Shell scripts (*.sh): every `IMAGE=` / `*_IMAGE=` assignment (plain,
+  export/readonly/local/declare/typeset) must carry a digest (a bare name
+  means :latest); any other way of setting such a variable is refused. A value that is only a repository name,
+  completed with a tag elsewhere, needs an explicit `# pin-check: repository`
+  comment on its line. Shell lines must not run `npm install` either.
 
 Forms this checker does not understand are reported as errors, never skipped.
 Bump a pin by changing tag and digest (or version comment and SHA) together.
 Usage: check_pins.py [repo-root]   (default: current directory)
 """
+import json
 import os
 import re
 import subprocess
@@ -36,8 +40,13 @@ NPM_INSTALL_ALIASES = {"install", "i", "in", "ins", "inst", "insta", "instal", "
                        "isnta", "isntal", "isntall", "add"}
 SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|&()`\n]")
 ESCAPED_KEY = re.compile(r"""(^|[\s{,\[-])"[^"]*\\[^"]*"\s*:""")
-IMAGE_KEY = re.compile(r"""^\s*(?:-\s+)?(['"]?)image\1\s*:\s*(.*)$""")
-SH_IMAGE = re.compile(r"""^\s*(?:export\s+|readonly\s+|local\s+)?([A-Za-z_]*IMAGE)=(['"]?)([^'"\s]*)\2""", re.I)
+IMAGE_KEY = re.compile(r"""(?:^|[\s{,\[-])(['"]?)(image|container)\1\s*:\s*([^,}\]\n]*)""")
+SH_IMAGE = re.compile(r"""^\s*(?:(?:export|readonly|local|declare|typeset)(?:\s+-[A-Za-z]+)*\s+)?"""
+                      r"""([A-Za-z_]*IMAGE)=(['"]?)([^'"\s]*)\2(?:\s|;|$)""", re.I)
+# Any other way of setting an *IMAGE variable (+=, printf -v, read, ...).
+SH_IMAGE_ANY = re.compile(r"""(?:^|[;&|(]\s*)(?:(?:export|readonly|local|declare|typeset)(?:\s+-[A-Za-z]+)*\s+)?"""
+                          r"""[A-Za-z_]*IMAGE\+?=|(?:printf\s+-v|\bread\b[^;|&]*)\s+[A-Za-z_]*IMAGE\b""", re.I)
+MAPPING_LINE = re.compile(r"""^(-\s|\?\s|['"]?[\w.-]+['"]?\s*:(\s|$))""")
 
 
 def is_dockerfile(path):
@@ -53,9 +62,16 @@ def is_workflow(path):
     return parts[0] == ".github" and path.endswith((".yml", ".yaml"))
 
 
-def runs_npm_install(command):
+def runs_npm_install(command, exec_form=False):
     """True if any simple command in `command` is npm with an install verb."""
-    flat = re.sub(r"""[\[\]",']""", " ", command)  # exec form / quoting
+    body = command.strip()
+    if exec_form and body.startswith("["):  # Dockerfile exec form
+        try:
+            body = " ".join(json.loads(body))
+        except ValueError:
+            return True  # unparseable: refuse rather than skip
+    flat = re.sub(r"\\(.)", r"\1", body)  # shell escapes: inst\all -> install
+    flat = re.sub(r"""["']""", "", flat)  # shell quoting: "inst"all -> install
     for segment in SEGMENT_SPLIT.split(flat):
         tokens = segment.split()
         for i, tok in enumerate(tokens):
@@ -80,7 +96,9 @@ def logical_lines(text):
     out, buf = [], ""
     for raw in text.splitlines():
         line = raw.rstrip()
-        if not buf and line.lstrip().startswith("#"):
+        # Docker drops comment lines (and blank lines) even inside a
+        # continuation, so they never end an instruction.
+        if line.lstrip().startswith("#") or (buf and not line.strip()):
             continue
         if line.endswith("\\"):
             buf += line[:-1] + " "
@@ -116,7 +134,11 @@ def check_dockerfile(text):
         if instr in ("run", "copy", "add") and re.search(r"<<-?\s*['\"]?\w", line):
             errors.append(f"unsupported heredoc: {line}")
             continue
-        if instr == "run" and runs_npm_install(line):
+        rest = words[1:]
+        while rest and rest[0].startswith("--"):
+            rest = rest[1:]
+        rest = " ".join(rest)
+        if instr == "run" and runs_npm_install(rest, exec_form=True):
             errors.append(f"use npm ci, not npm install: {line}")
         if instr in ("copy", "add", "run"):
             for w in words[1:]:
@@ -134,7 +156,14 @@ def check_dockerfile(text):
                         if e:
                             errors.append(e)
         if instr == "add":
-            srcs = [w for w in words[1:] if not w.startswith("--")][:-1]
+            if rest.startswith("["):
+                try:
+                    srcs = [str(x) for x in json.loads(rest)][:-1]
+                except ValueError:
+                    errors.append(f"cannot parse: {line}")
+                    continue
+            else:
+                srcs = rest.split()[:-1]
             for src in srcs:
                 if re.match(r"(git@|git://|ssh://)", src) or src.endswith(".git") or "github.com/" in src and "#" in src:
                     errors.append(f"ADD from git is not pinned by content: {src}")
@@ -174,22 +203,77 @@ def unquote(value):
     return value
 
 
+BLOCK_START = re.compile(r"""^(\s*)(?:-\s+)?[\w"'-]+\s*:\s*([|>])[-+0-9]*\s*(?:#.*)?$""")
+
+
+def yaml_commands(lines):
+    """(line number, text) for every line, plus each block scalar decoded
+    roughly as the shell sees it: literal blocks keep newlines but join
+    backslash continuations; folded blocks join lines with spaces."""
+    out = [(n, strip_comment(l)) for n, l in enumerate(lines, 1) if not l.lstrip().startswith("#")]
+    i = 0
+    while i < len(lines):
+        m = BLOCK_START.match(lines[i])
+        i += 1
+        if not m:
+            continue
+        start, indent, body = i, len(m.group(1)), []
+        while i < len(lines) and (not lines[i].strip() or
+                                  len(lines[i]) - len(lines[i].lstrip()) > indent):
+            body.append(lines[i].strip())
+            i += 1
+        text = ("\n" if m.group(2) == "|" else " ").join(body)
+        text = re.sub(r"\\\s*\n", " ", text)
+        out.append((start, text))
+    return out
+
+
 def check_workflow(text, local_action_exists=lambda ref: True):
     errors = []
-    for n, raw in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    for n, command in yaml_commands(lines):
+        if runs_npm_install(command):
+            errors.append(f"line {n}: use npm ci, not npm install: {command.strip()[:120]}")
+    for n, raw in enumerate(lines, 1):
         if raw.lstrip().startswith("#"):
             continue
-        if runs_npm_install(strip_comment(raw)):
-            errors.append(f"line {n}: use npm ci, not npm install: {raw.strip()}")
         if ESCAPED_KEY.search(raw):
             errors.append(f"line {n}: unsupported quoted key with escapes: {raw.strip()}")
             continue
-        im = IMAGE_KEY.match(raw)
-        if im:
-            value = unquote(im.group(2))
+        for im in IMAGE_KEY.finditer(strip_comment(raw)):
+            raw_value = strip_comment(im.group(3))
+            if raw_value[:1] in ("&", "*", "!"):
+                errors.append(f"line {n}: unsupported YAML anchor/alias/tag on {im.group(2)}: {raw_value}")
+                continue
+            if raw_value[:1] in ("'", '"') and (len(raw_value) < 2 or raw_value[-1] != raw_value[0]):
+                errors.append(f"line {n}: unsupported multi-line quoted {im.group(2)} value")
+                continue
+            value = unquote(raw_value)
+            if raw_value.startswith("{"):
+                continue  # flow mapping: its image key is matched by this same loop
+            if not value or value[0] in "|>":
+                # Value on the following, more-indented lines: a block scalar,
+                # a multi-line plain scalar, or (container:) a mapping.
+                indent = len(raw) - len(raw.lstrip())
+                body = []
+                for nxt in lines[n:]:
+                    if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= indent:
+                        break
+                    if nxt.strip():
+                        body.append(nxt.strip())
+                if not body:
+                    continue
+                if not value and MAPPING_LINE.match(body[0]):
+                    # container: mapping (its image: line is checked itself),
+                    # or a job that happens to be named "image".
+                    continue
+                value = unquote(" ".join(strip_comment(b) for b in body))
             if "${{" in value:
                 errors.append(f"line {n}: image from an expression, cannot verify pin: {value}")
-            elif value and not value.endswith("Dockerfile") and not DIGEST.search(value):
+            elif (im.group(2) == "image" and value.endswith("Dockerfile")
+                  and not value.startswith("docker://")):
+                continue  # local Docker action build
+            elif not DIGEST.search(value):
                 errors.append(f"line {n}: image not pinned by digest: {value}")
         if not USES_ANYWHERE.search(raw):
             continue
@@ -213,13 +297,26 @@ def check_workflow(text, local_action_exists=lambda ref: True):
 
 def check_shell(text):
     errors = []
-    for n, raw in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    # Join backslash continuations so `npm \ install` is one command.
+    joined = re.sub(r"\\\n", " ", "\n".join(l for l in lines if not l.lstrip().startswith("#")))
+    for command in joined.split("\n"):
+        if runs_npm_install(strip_comment(command)):
+            errors.append(f"use npm ci, not npm install: {command.strip()[:120]}")
+    for n, raw in enumerate(lines, 1):
+        if raw.lstrip().startswith("#"):
+            continue
         m = SH_IMAGE.match(raw)
         if not m:
+            if SH_IMAGE_ANY.search(strip_comment(raw)):
+                errors.append(f"line {n}: unsupported way of setting an image variable: {raw.strip()}")
             continue
         value = m.group(3)
-        has_tag = ":" in value.rsplit("/", 1)[-1]
-        if (has_tag or "@" in value) and not DIGEST.search(value):
+        if not value or re.search(r"#\s*pin-check:\s*repository\b", raw):
+            continue
+        if "$" in value:
+            errors.append(f"line {n}: image from a variable, cannot verify pin: {m.group(1)}={value}")
+        elif not DIGEST.search(value):
             errors.append(f"line {n}: image not pinned by digest: {m.group(1)}={value}")
     return errors
 
@@ -266,7 +363,8 @@ def main(argv):
         print(f"{failures} unpinned build input(s); pin images as tag@sha256:<digest> "
               "and actions to a full commit SHA (with a # vX.Y.Z comment).")
         return 1
-    print(f"{checked} files checked; all build inputs pinned.")
+    print(f"{checked} files checked: image, frontend and action references pinned, "
+          "no npm install (see the script header for exactly what is checked).")
     return 0
 
 

@@ -30,11 +30,10 @@ WORKDIR /app
 ENV NODE_ENV=production \
     DATA_DIR=/data \
     PORT=8080
-# apk packages here come from the pinned base image's Alpine release branch and
-# are verified against the signing keys inside that pinned image. They are not
-# version-pinned: Alpine drops superseded versions from its mirrors, which would
-# break rebuilds. Residual of audit deploy-4, for the owner to accept or to
-# replace with a reviewed package snapshot.
+# Alpine packages (this RUN and the next) are deliberately left unpinned
+# (owner decision, audit deploy-4): pinning apk versions breaks rebuilds
+# whenever Alpine rotates packages out of its mirrors. They come from the
+# pinned base's own release branch, verified against its signing keys.
 RUN apk add --no-cache sqlite-libs tini \
  && addgroup -S proxy \
  && adduser -S proxy -G proxy \
@@ -43,7 +42,8 @@ RUN apk add --no-cache sqlite-libs tini \
 COPY package.json package-lock.json ./
 # Lifecycle scripts are off; the one native module, better-sqlite3, is then
 # compiled from its lockfile-verified tarball against the base image's Node
-# headers, never from a prebuilt binary downloaded from GitHub.
+# headers, never from a prebuilt binary downloaded from GitHub. The toolchain
+# apk packages are unpinned on purpose, as above.
 RUN apk add --no-cache --virtual .build python3 make g++ sqlite-dev \
  && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
  && npm_config_build_from_source=better-sqlite3 npm_config_nodedir=/usr/local \
