@@ -172,3 +172,52 @@ describe("review round 4: hard bounds", () => {
     expect(store.getState(1, "email")).toBeGreaterThan(before);
   });
 });
+
+describe("final review quick fixes", () => {
+  it("many absent header properties don't rescan a large header block each", async () => {
+    const block = Array.from({ length: 20_000 }, (_, i) => `X-F${i}: v`).join("\r\n") + "\r\n\r\n";
+    const id = encodeEmailId({ accountIdx: 1, mailboxIdx: 2, uidvalidity: 1, uid: 7 });
+    const ctx = () => ({ account: store.getAccountById(1)!, client: server({ subject: "s" }, undefined, block), store, budgets: newRequestBudgets() }) as never;
+    const props = Array.from({ length: 128 }, (_, i) => `header:X-Absent-${i}`);
+    const t = performance.now();
+    const res = await emailGet({ accountId: "1", ids: [id], properties: ["id", ...props] }, ctx());
+    expect(performance.now() - t).toBeLessThan(2000);
+    expect(res.list[0]!["header:X-Absent-0"]).toBeNull();
+    await expect(emailGet({ accountId: "1", ids: [id], properties: ["id", ...props, "header:One-Too-Many"] }, ctx()))
+      .rejects.toMatchObject({ type: "requestTooLarge" });
+  });
+
+  it("an abandoned draft create stops mid-download and appends nothing", async () => {
+    const { emailSet } = await import("../../src/jmap/methods/email.js");
+    const ac = new AbortController();
+    const budgets = { ...newRequestBudgets(), signal: ac.signal };
+    const blobId = `P${encodeEmailId({ accountIdx: 1, mailboxIdx: 2, uidvalidity: 1, uid: 7 })}:2`;
+    let chunksRead = 0;
+    const client = {
+      mailbox: { uidValidity: 1n },
+      getMailboxLock: async () => ({ release() {} }),
+      close() {},
+      append: async () => ({ uid: 9, uidValidity: 1n }),
+      download: async () => ({
+        meta: { contentType: "application/pdf" },
+        content: (async function* () {
+          for (let i = 0; i < 5; i++) {
+            if (i === 1) ac.abort();
+            chunksRead++;
+            yield Buffer.alloc(1024);
+          }
+        })(),
+      }),
+    };
+    const appendSpy = { called: false };
+    client.append = async () => ((appendSpy.called = true), { uid: 9, uidValidity: 1n });
+    const res = await emailSet({ accountId: "1", create: { d: {
+      mailboxIds: { [encodeMailboxId({ accountIdx: 1, mailboxIdx: 2 })]: true },
+      bodyValues: { "1": { value: "hi" } }, textBody: [{ partId: "1" }],
+      attachments: [{ blobId, type: "application/pdf" }],
+    } } }, { account: store.getAccountById(1)!, client, store, budgets } as never);
+    expect(res.created).toBeNull();
+    expect(appendSpy.called).toBe(false);
+    expect(chunksRead).toBeLessThan(5);
+  });
+});

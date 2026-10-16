@@ -3,6 +3,7 @@ import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
 import { viewEmailState, type ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
+import type { ParsedHeader } from "../../imap/headers.js";
 import {
   fetchEmailsBatch,
   MAX_FULL_HEADER_BYTES_PER_CALL,
@@ -57,6 +58,9 @@ interface MailCtx {
   /** Shared by every Email/get of one HTTP request; fresh per call if absent. */
   budgets?: RequestBudgets;
 }
+
+// header:* properties one Email/get may ask for; clients use a handful.
+const MAX_HEADER_PROPERTIES = 128;
 
 // Same default as the config's MAX_OBJECTS_IN_GET.
 const DEFAULT_MAX_OBJECTS_IN_GET = 500;
@@ -363,9 +367,10 @@ function sortValue(h: SortableHit, prop: string, kw: string | undefined): number
   switch (prop) {
     case "receivedAt": return h.receivedAt ?? 0;
     case "size": return h.size ?? 0;
-    case "from": return (h.from ?? "").toLowerCase();
-    case "to": return (h.to ?? "").toLowerCase();
-    case "subject": return (h.subject ?? "").toLowerCase();
+    // Already lower-cased and bounded (sortKey).
+    case "from": return h.from ?? "";
+    case "to": return h.to ?? "";
+    case "subject": return h.subject ?? "";
     case "sentAt": return h.sentAt ?? 0;
     case "hasKeyword":
       // The hit holds raw IMAP flags. Map the JMAP keyword the client picked
@@ -408,12 +413,15 @@ async function fetchSortMetadata(
     : { uid: true, internalDate: true };
   for await (const msg of fetchByUid(client, uids, query)) {
     const uid = Number(msg.uid);
+    // Only sort keys are kept, as each message arrives: lower-cased once and
+    // cut to SORT_KEY_CHARS, so a sender's huge Subject or address costs
+    // neither memory per hit nor work per comparison.
     out.set(uid, {
       receivedAt: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
       size: typeof msg.size === "number" ? msg.size : undefined,
-      from: pickFirstAddr((msg.envelope as { from?: { address?: string }[] } | undefined)?.from),
-      to: pickFirstAddr((msg.envelope as { to?: { address?: string }[] } | undefined)?.to),
-      subject: (msg.envelope as { subject?: string } | undefined)?.subject,
+      from: sortKey(pickFirstAddr((msg.envelope as { from?: { address?: string }[] } | undefined)?.from)),
+      to: sortKey(pickFirstAddr((msg.envelope as { to?: { address?: string }[] } | undefined)?.to)),
+      subject: sortKey((msg.envelope as { subject?: string } | undefined)?.subject),
       sentAt: (msg.envelope as { date?: Date | string } | undefined)?.date
         ? new Date((msg.envelope as { date: Date | string }).date).getTime()
         : 0,
@@ -421,6 +429,12 @@ async function fetchSortMetadata(
     });
   }
   return out;
+}
+
+const SORT_KEY_CHARS = 256;
+
+function sortKey(v: unknown): string | undefined {
+  return typeof v === "string" ? v.slice(0, SORT_KEY_CHARS).toLowerCase() : undefined;
 }
 
 function pickFirstAddr(addrs: { address?: string }[] | undefined): string | undefined {
@@ -844,6 +858,9 @@ export async function emailGet(
       throw invalidArguments(`invalid property: ${JSON.stringify(String(p)).slice(0, 80)}`);
     }
   }
+  if ((properties ?? []).filter((p) => p.startsWith("header:")).length > MAX_HEADER_PROPERTIES) {
+    throw new JmapError("requestTooLarge", `at most ${MAX_HEADER_PROPERTIES} header:* properties per Email/get`);
+  }
   const notFound: string[] = [];
   // If the client picked an explicit property set, skip the preview FETCH
   // unless `preview` was requested. This is the common path for header-only
@@ -976,6 +993,22 @@ function projectEmailForGet(
     return value;
   };
   const headers = email._headers;
+  // One pass over the header list, then a lookup per projection: requesting
+  // many (absent) header names must not rescan a large header block each time.
+  let byName: Map<string, ParsedHeader[]> | null = null;
+  const headersNamed = (prop: string): ParsedHeader[] => {
+    if (!byName) {
+      byName = new Map();
+      for (const h of headers) {
+        const k = h.name.toLowerCase();
+        const l = byName.get(k);
+        if (l) l.push(h);
+        else byName.set(k, [h]);
+      }
+    }
+    const name = /^header:([^:]+)/.exec(prop)?.[1]?.toLowerCase() ?? "";
+    return byName.get(name) ?? [];
+  };
   // Default property set per RFC 8621 §4.2 Email/get if the client doesn't
   // pick one. We mirror the upstream test suite's expectations here — id is
   // always present; everything else is included by default.
@@ -992,7 +1025,7 @@ function projectEmailForGet(
     // The key goes out too, escaped.
     budgets.response.remaining -= Buffer.byteLength(JSON.stringify(p));
     if (p.startsWith("header:")) {
-      out[p] = emit(projectHeaderProp(headers, p), true);
+      out[p] = emit(projectHeaderProp(headersNamed(p), p), true);
       continue;
     }
     if (p === "headers") {
@@ -1654,18 +1687,21 @@ async function applyEmailCreate(
     let blob;
     try {
       const max = Math.min(Math.floor(remaining / count), Math.floor(encodedRemaining / (count * BASE64_WORST)));
-      blob = await readBlob(blobId, ctx, max);
+      blob = await readBlob(blobId, ctx, max, ctx.budgets?.signal);
     } catch (e) {
       if (e instanceof BlobTooLargeError) throw tooLarge();
       throw e;
     }
     if (!blob) continue;
+    checkAborted(ctx.budgets?.signal);
     remaining -= blob.body.length * count;
     encodedRemaining -= Math.ceil(blob.body.length * count * BASE64_WORST);
     if (remaining < 0 || encodedRemaining < 0) throw tooLarge();
     blobs.set(blobId, blob);
   }
 
+  // A client that went away doesn't get a draft built (or stored) for it.
+  checkAborted(ctx.budgets?.signal);
   let mime: Buffer;
   try {
     mime = await buildRfc822(
@@ -1683,6 +1719,7 @@ async function applyEmailCreate(
   }
 
   const idate = typeof payload.receivedAt === "string" ? new Date(payload.receivedAt) : undefined;
+  checkAborted(ctx.budgets?.signal);
   const res = await ctx.client.append(target.name, mime, flags.length ? flags : undefined, idate);
   if (!res) {
     throw new JmapError("serverFail", `APPEND to "${target.name}" failed`);

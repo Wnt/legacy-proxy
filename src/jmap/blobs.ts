@@ -7,6 +7,7 @@ import { Buffer } from "node:buffer";
 import { selectedUidValidity, withMailbox } from "../imap/client.js";
 import type { ImapPool } from "../imap/pool.js";
 import { decodeBlobId, decodeEmailId } from "../mapping/ids.js";
+import { checkAborted } from "../imap/fetcher.js";
 import type { AccountRow, Store } from "../state/store.js";
 
 // Above the 50 MB attachment and upload limits, with room for a whole message
@@ -29,6 +30,7 @@ export async function readBlob(
   blobId: string,
   ctx: { account: AccountRow; store: Store; client: ImapFlow; pool?: ImapPool },
   maxBytes: number = MAX_BLOB_READ_BYTES,
+  signal?: AbortSignal,
 ): Promise<{ body: Buffer; ctype: string } | null> {
   const limit = Math.min(maxBytes, MAX_BLOB_READ_BYTES);
   if (blobId.startsWith("U")) {
@@ -71,6 +73,9 @@ export async function readBlob(
           // Everything read here is held in memory (and then MIME-encoded
           // again), so cap it; mail this large cannot be sent anyway.
           if (total > limit) throw new BlobTooLargeError(blobId);
+          // The request was abandoned: stop downloading (the connection is
+          // closed below, since the FETCH is cut off mid-literal).
+          checkAborted(signal);
           chunks.push(chunk as Buffer);
         }
       } catch (e) {

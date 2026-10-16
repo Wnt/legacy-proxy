@@ -618,13 +618,17 @@ async function fetchBodyValuesBatched(
         g.members.map((m) => m.uid),
         { uid: true, bodyParts: g.parts.map((p) => ({ key: p.partId, start: 0, maxLength: p.maxLength })) },
       )) {
+        checkAborted(opts.signal);
         if (msg.uid != null && msg.bodyParts) rawByUid.set(msg.uid, msg.bodyParts);
       }
     } catch (e) {
+      // An abandoned request stops here; only IMAP failures are best-effort.
+      if (e instanceof BudgetExceededError) throw e;
       // fall through: members without raw parts get isEncodingProblem below
       log.warn({ uids: g.members.map((m) => m.uid), partIds: g.parts.map((p) => p.partId), ...imapErrorDetails(e) }, "body part FETCH failed");
     }
     const ceiling = new Map(g.parts.map((p) => [p.partId, p.maxLength]));
+    checkAborted(opts.signal);
     for (const m of g.members) {
       const bodyParts = rawByUid.get(m.uid);
       const values: JmapEmail["bodyValues"] = {};

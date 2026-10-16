@@ -127,11 +127,14 @@ Changes from upstream:
     64 MiB per-request metadata allowance. The message cache and scan
     checkpoints are reset once more on upgrade (`user_version` 2), states
     moved, so the thread index is rebuilt. Invalid `header:` property names
-    are refused rather than echoed. A
+    are refused rather than echoed, at most 128 `header:*` properties are
+    answered per Email/get (from a per-message index of header names), and
+    Email/query keeps only lower-cased 256-character sort keys per hit. A
     message's cached threadId is reused, so Email/get and the thread scan
     report the same one. A client that disconnects stops its request: it
     leaves the per-account queue, and Email/get and draft creation stop at
-    their next step. A draft's
+    their next step (also mid-download of an attachment, and before the
+    draft is built or appended). A draft's
     MIME is built from at most 50 MB (the advertised
     `maxSizeAttachmentsPerEmail`) of blobs and body values: `mimeContentPlan`
     counts every occurrence the builder will encode, the way it decides, and
