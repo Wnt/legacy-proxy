@@ -17,8 +17,8 @@ import { accountNotFound, cannotCalculateChanges } from "../errors.js";
 import { withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { listMailboxes, liveMailboxStatus, type LiveMailboxStatus } from "./mailbox.js";
-import { parseHeaderBlock, computeThreadIdFromHeaders } from "../../imap/headers.js";
-import { fetchHeadersBounded } from "../../imap/fetcher.js";
+import { parseHeaderBlock, threadIdFromInputs, threadInputs } from "../../imap/headers.js";
+import { headerBlocksBounded } from "../../imap/fetcher.js";
 import { log } from "../../util/log.js";
 import { type ChangesResponse } from "./_shared.js";
 
@@ -73,11 +73,62 @@ export function sameAsLastScan(
 
 // Bring the email_cache rows for one folder up to date with the live mailbox.
 // Assumes the mailbox is already SELECTed on `client`.
-// The threading fields of each message, fetched with the same bound (and so
-// the same bytes) as Email/get's, so both compute the same threadId.
-function boundedThreadHeaders(client: ImapFlow, metas: FetchMessageObject[]): Promise<Map<number, Buffer>> {
-  const sizes = new Map(metas.map((m) => [m.uid!, m.size]));
-  return fetchHeadersBounded(client, [...sizes.keys()], (uid) => sizes.get(uid), false);
+// What the scan keeps per message between its two FETCH phases: no header
+// data, and the envelope's Message-ID only within threading's own bound.
+interface ScanMeta {
+  uid: number;
+  size: number | undefined;
+  messageId: string | null;
+  internaldate: number;
+}
+
+function scanMeta(msg: FetchMessageObject): ScanMeta {
+  const mid = (msg.envelope as { messageId?: string } | undefined)?.messageId ?? null;
+  return {
+    uid: msg.uid!,
+    size: msg.size,
+    messageId: mid && mid.length <= 1000 ? mid : null,
+    internaldate: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
+  };
+}
+
+// Messages whose header blocks are fetched, reduced and written per batch, so
+// a scan holds at most one block and one batch of rows however large the
+// folder is.
+const SCAN_BATCH = 256;
+
+// Thread rows for `metas`: header blocks fetched with the same bound (and so
+// the same bytes) as Email/get's, reduced to ThreadInputs as each arrives.
+async function indexMessages(
+  client: ImapFlow,
+  account: AccountRow,
+  mailboxId: number,
+  uidvalidity: number,
+  metas: ScanMeta[],
+  store: Store,
+): Promise<void> {
+  for (let i = 0; i < metas.length; i += SCAN_BATCH) {
+    const batch = new Map(metas.slice(i, i + SCAN_BATCH).map((m) => [m.uid, m]));
+    const upserts: EmailCacheUpsert[] = [];
+    for await (const { uid, block } of headerBlocksBounded(client, [...batch.keys()], (u) => batch.get(u)?.size, false)) {
+      const m = batch.get(uid);
+      if (!m) continue;
+      const thread = threadInputs(parseHeaderBlock(block));
+      const tid =
+        threadIdFromInputs(thread, m.messageId) ??
+        encodeEmailId({ accountIdx: account.id, mailboxIdx: mailboxId, uidvalidity, uid });
+      upserts.push({
+        accountId: account.id,
+        mailboxId,
+        uidvalidity,
+        uid,
+        threadId: tid,
+        threadInputs: JSON.stringify(thread),
+        internaldate: m.internaldate,
+      });
+    }
+    store.upsertEmailCacheRows(upserts);
+  }
 }
 
 async function syncMailboxScan(
@@ -106,8 +157,7 @@ async function syncMailboxScan(
   }
 
   if (exists > 0 && uidNext > startUid) {
-    const upserts: EmailCacheUpsert[] = [];
-    const metas: FetchMessageObject[] = [];
+    const metas: ScanMeta[] = [];
     for await (const msg of client.fetch(
       `${startUid}:*`,
       { uid: true, envelope: true, internalDate: true, size: true },
@@ -116,26 +166,9 @@ async function syncMailboxScan(
       // `${x}:*` returns the highest-UID message even when x exceeds it. A
       // FLAGS-only FETCH pushed mid-command has no envelope: not ours.
       if (msg.uid == null || msg.uid < startUid || !msg.envelope) continue;
-      metas.push(msg);
+      metas.push(scanMeta(msg));
     }
-    const blocks = await boundedThreadHeaders(client, metas);
-    for (const msg of metas) {
-      if (msg.uid == null) continue;
-      const headers = parseHeaderBlock(blocks.get(msg.uid) ?? "");
-      const env = msg.envelope as { messageId?: string } | undefined;
-      const tid =
-        computeThreadIdFromHeaders(headers, env?.messageId ?? null) ??
-        encodeEmailId({ accountIdx: account.id, mailboxIdx: mailboxId, uidvalidity, uid: msg.uid });
-      upserts.push({
-        accountId: account.id,
-        mailboxId,
-        uidvalidity,
-        uid: msg.uid,
-        threadId: tid,
-        internaldate: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
-      });
-    }
-    store.upsertEmailCacheRows(upserts);
+    await indexMessages(client, account, mailboxId, uidvalidity, metas, store);
   }
 
   // Reconcile expunges (and self-heal any cache gaps): only when the row
@@ -149,34 +182,16 @@ async function syncMailboxScan(
     const cachedSet = new Set(cachedUids);
     const gaps = [...live].filter((uid) => !cachedSet.has(uid));
     if (gaps.length > 0) {
-      const upserts: EmailCacheUpsert[] = [];
-      const metas: FetchMessageObject[] = [];
+      const metas: ScanMeta[] = [];
       for await (const msg of fetchByUid(
         client,
         gaps,
         { uid: true, envelope: true, internalDate: true, size: true },
       )) {
         if (msg.uid == null || !msg.envelope) continue;
-        metas.push(msg);
+        metas.push(scanMeta(msg));
       }
-      const blocks = await boundedThreadHeaders(client, metas);
-      for (const msg of metas) {
-        if (msg.uid == null) continue;
-        const headers = parseHeaderBlock(blocks.get(msg.uid) ?? "");
-        const env = msg.envelope as { messageId?: string } | undefined;
-        const tid =
-          computeThreadIdFromHeaders(headers, env?.messageId ?? null) ??
-          encodeEmailId({ accountIdx: account.id, mailboxIdx: mailboxId, uidvalidity, uid: msg.uid });
-        upserts.push({
-          accountId: account.id,
-          mailboxId,
-          uidvalidity,
-          uid: msg.uid,
-          threadId: tid,
-          internaldate: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
-        });
-      }
-      store.upsertEmailCacheRows(upserts);
+      await indexMessages(client, account, mailboxId, uidvalidity, metas, store);
     }
   }
 

@@ -1,7 +1,6 @@
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { Database as DB, Statement } from "better-sqlite3";
-import { MAX_HEADER_BLOCK_BYTES } from "../imap/headers.js";
 
 export interface AccountRow {
   id: number;
@@ -92,6 +91,8 @@ CREATE TABLE IF NOT EXISTS email_cache (
   headers_full  INTEGER NOT NULL DEFAULT 0,
   preview       TEXT,
   created_at    INTEGER NOT NULL,
+  -- ThreadInputs JSON (src/imap/headers.ts): what thread_id was derived from.
+  thread_inputs TEXT,
   PRIMARY KEY (account_id, mailbox_id, uid)
 );
 CREATE INDEX IF NOT EXISTS email_cache_thread_idx ON email_cache(account_id, thread_id);
@@ -194,12 +195,28 @@ export class Store {
   constructor(dataDir: string) {
     this.db = new Database(path.join(dataDir, "proxy.db"));
     this.db.exec(SCHEMA);
-    // Header blocks cached before fetches were bounded can exceed what a
-    // fetch returns now. Drop them (the row stays; its headers are refetched,
-    // bounded, on next use) so they are never loaded whole again.
-    this.db
-      .prepare(`UPDATE email_cache SET headers_raw = NULL, headers_full = 0 WHERE length(headers_raw) > ?`)
-      .run(MAX_HEADER_BLOCK_BYTES);
+    this.migrate();
+  }
+
+  // One-time upgrades, tracked in PRAGMA user_version.
+  private migrate(): void {
+    const version = this.db.pragma("user_version", { simple: true }) as number;
+    if (version < 1) {
+      // v1: header fetches are bounded and threading inputs are derived once
+      // and cached (thread_inputs). Rows cached before could hold unbounded
+      // header blocks, or threading data from parts of a header a fetch no
+      // longer returns. Drop the cached messages and the scan checkpoints, so
+      // every row is rebuilt the new way, and move every state so clients
+      // resync instead of trusting their copies of thread membership.
+      this.db.transaction(() => {
+        const cols = this.db.prepare(`PRAGMA table_info(email_cache)`).all() as { name: string }[];
+        if (!cols.some((c) => c.name === "thread_inputs")) {
+          this.db.exec(`ALTER TABLE email_cache ADD COLUMN thread_inputs TEXT`);
+        }
+        this.db.exec(`DELETE FROM email_cache; DELETE FROM mailbox_scan; UPDATE state_log SET state = state + 1;`);
+        this.db.pragma("user_version = 1");
+      })();
+    }
   }
 
   /** Prepared statement for `sql`, compiled once and cached. */
@@ -603,11 +620,15 @@ export class Store {
     const stmt = this.prep(
       `INSERT INTO email_cache(
          account_id, mailbox_id, uidvalidity, uid, thread_id, internaldate,
-         size, envelope, bodystructure, headers_raw, headers_full, preview, created_at
-       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+         size, envelope, bodystructure, headers_raw, headers_full, preview, created_at,
+         thread_inputs
+       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(account_id, mailbox_id, uid) DO UPDATE SET
          uidvalidity   = excluded.uidvalidity,
-         thread_id     = COALESCE(excluded.thread_id, thread_id),
+         -- A message's threading is derived once: the first writer wins, so
+         -- the thread scan and Email/get can never disagree about it later.
+         thread_id     = COALESCE(thread_id, excluded.thread_id),
+         thread_inputs = COALESCE(thread_inputs, excluded.thread_inputs),
          internaldate  = MAX(excluded.internaldate, internaldate),
          size          = COALESCE(excluded.size, size),
          envelope      = COALESCE(excluded.envelope, envelope),
@@ -624,7 +645,7 @@ export class Store {
           r.accountId, r.mailboxId, r.uidvalidity, r.uid,
           r.threadId ?? null, r.internaldate ?? 0, r.size ?? null,
           r.envelope ?? null, r.bodystructure ?? null, r.headersRaw ?? null,
-          r.headersFull ? 1 : 0, r.preview ?? null, now,
+          r.headersFull ? 1 : 0, r.preview ?? null, now, r.threadInputs ?? null,
         );
       }
     });
@@ -722,6 +743,7 @@ export interface EmailCacheRow {
   headers_full: number;
   preview: string | null;
   created_at: number;
+  thread_inputs: string | null;
 }
 
 export interface EmailCacheUpsert {
@@ -737,6 +759,8 @@ export interface EmailCacheUpsert {
   headersRaw?: Buffer | null;
   headersFull?: boolean;
   preview?: string | null;
+  /** ThreadInputs JSON; written with threadId. */
+  threadInputs?: string | null;
 }
 
 export interface ThreadIndexRow {

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { simpleParser } from "mailparser";
 import { buildRfc822, type JmapEmailCreate, type BodyStructurePart } from "../mapping/buildMime.js";
+import { InvalidEmailCreateError, validateEmailCreate } from "../mapping/emailCreate.js";
 import { JmapError } from "../jmap/errors.js";
 import { SIDE_RESPONSES, type MethodTable } from "../jmap/router.js";
 import { GmailNotSent, type GmailApi } from "./api.js";
@@ -300,6 +301,14 @@ export class GmailCompose {
         : body;
     }
     create.bodyValues = values as JmapEmailCreate["bodyValues"];
+    // The shared schema check buildRfc822 also runs, here before any blob
+    // download, and answered as the input error it is.
+    try {
+      validateEmailCreate(create);
+    } catch (e) {
+      if (e instanceof InvalidEmailCreateError) fail("invalidProperties", e.message);
+      throw e;
+    }
     const blobs = new Map<string, { body: Buffer; ctype: string }>();
     let parts = 0,
       total = 0;

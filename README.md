@@ -65,17 +65,24 @@ Changes from upstream:
     header of `<`s, on every listing and push lookup. They now use linear
     scanners with the same results (fuzz-tested against the old regexes).
     Header blocks are bounded on the wire: a message larger than 512 KiB gets
-    its header as the partial `BODY.PEEK[HEADER]<0.524288>` (cut down to the
-    threading fields when only those are needed); a smaller one can't have a
-    larger header and keeps the cheap `HEADER.FIELDS` fetch. This costs one
-    extra FETCH round trip for uncached messages. Email/get and the
-    thread-index scan share this fetch, so a message's threadId comes from
-    the same bytes on every path. Each unfolded field is parsed up to
-    128 KiB; message ids holding a stray `<` or longer than 998 characters
-    are skipped, so threading falls back to the next reference or the
-    message's own id. Cached header blocks over the bound are dropped at
-    startup and refetched. imapflow's literal/response limits are lowered
-    from 1/2 GiB to 128/160 MiB as a backstop. Code: `src/imap/headers.ts`,
+    its header as the partial `BODY.PEEK[HEADER]<0.524288>`; a smaller one
+    can't have a larger header and keeps the cheap `HEADER.FIELDS` fetch.
+    This costs one extra FETCH round trip for uncached messages. Blocks are
+    handled one at a time: each is reduced at once to its threading inputs
+    (Message-ID, In-Reply-To and References id lists, each kept up to 32 KiB),
+    the thread scan writes rows in batches of 256, and one Email/get keeps at
+    most 16 MiB of full header blocks for `headers`/`header:*` (later
+    messages in that call get none). The threading inputs are derived once
+    per message and cached with it (`email_cache.thread_inputs`, first writer
+    wins), so Email/get with or without full headers and the thread scan
+    always give a message the same threadId and `references`. Each unfolded
+    field is parsed up to 128 KiB; message ids holding a stray `<` or longer
+    than 998 characters are skipped, so threading falls back to the next
+    reference or the message's own id. On first start the message cache and
+    scan checkpoints are dropped once (`PRAGMA user_version` 1) and every
+    state moves, so caches are rebuilt this way and clients resync. imapflow's
+    literal/response/line limits are lowered from 1/2/1 GiB to
+    128/160/16 MiB as a backstop. Code: `src/imap/headers.ts`,
     `src/imap/fetcher.ts`, `src/jmap/methods/threads.ts`,
     `src/imap/client.ts`, `src/state/store.ts`.
 

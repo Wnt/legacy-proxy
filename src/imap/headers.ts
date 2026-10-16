@@ -282,6 +282,57 @@ export function asDate(headers: ParsedHeader[], name: string): string | null {
   return d.toISOString();
 }
 
+// The parts of a message's headers that threading and the `references`
+// property use, as message-id lists. Derived once from the header block a
+// fetch returned, then cached with the message (email_cache.thread_inputs),
+// so the threadId and `references` of a message do not depend on which path
+// (Email/get with or without full headers, the thread-index scan) saw it
+// first, or on how its headers were later stored.
+export interface ThreadInputs {
+  messageId: string[] | null;
+  inReplyTo: string[] | null;
+  references: string[] | null;
+}
+
+// Each list is kept up to this many characters: a sender can't make every
+// cached row and every listing carry megabytes of ids. A 300-message thread's
+// References is ~15 KB; threading only uses the first id.
+const MAX_THREAD_LIST_CHARS = 32 * 1024;
+
+function capIds(ids: string[] | null): string[] | null {
+  if (!ids) return null;
+  const out: string[] = [];
+  let n = 0;
+  for (const id of ids) {
+    n += id.length + 2;
+    if (n > MAX_THREAD_LIST_CHARS) break;
+    out.push(id);
+  }
+  return out.length ? out : null;
+}
+
+export function threadInputs(headers: ParsedHeader[]): ThreadInputs {
+  return {
+    messageId: capIds(asMessageIds(headers, "Message-ID")),
+    inReplyTo: capIds(asMessageIds(headers, "In-Reply-To")),
+    references: capIds(asMessageIds(headers, "References")),
+  };
+}
+
+/** Parse cached ThreadInputs JSON; null when absent or not of that shape. */
+export function parseThreadInputs(json: string | null | undefined): ThreadInputs | null {
+  if (!json) return null;
+  try {
+    const v = JSON.parse(json) as Record<string, unknown>;
+    const list = (x: unknown): string[] | null =>
+      Array.isArray(x) && x.every((s) => typeof s === "string") ? (x as string[]) : null;
+    if (!v || typeof v !== "object") return null;
+    return { messageId: list(v.messageId), inReplyTo: list(v.inReplyTo), references: list(v.references) };
+  } catch {
+    return null;
+  }
+}
+
 // Compute a stable JMAP threadId for a message from its headers, per the
 // classic IMAP-threading heuristic (RFC 8621 §3 doesn't mandate a specific
 // algorithm, so we follow the JWZ "References then In-Reply-To" approach):
@@ -289,18 +340,20 @@ export function asDate(headers: ParsedHeader[], name: string): string | null {
 //   2. If References is absent, fall back to In-Reply-To.
 //   3. If both are absent, the message is its own root.
 // We hash the chosen Message-Id so the threadId is opaque and URL-safe.
+export function threadIdFromInputs(t: ThreadInputs, envelopeMessageId?: string | null): string | null {
+  if (t.references?.length) return hashThreadId(t.references[0]!);
+  if (t.inReplyTo?.length) return hashThreadId(t.inReplyTo[0]!);
+  if (t.messageId?.length) return hashThreadId(t.messageId[0]!);
+  // The server's ENVELOPE copy of a sender-supplied Message-ID; same bound as ours.
+  if (envelopeMessageId && envelopeMessageId.length <= MAX_MSG_ID_CHARS + 2) return hashThreadId(envelopeMessageId);
+  return null;
+}
+
 export function computeThreadIdFromHeaders(
   headers: ParsedHeader[],
   envelopeMessageId?: string | null,
 ): string | null {
-  const refs = asMessageIds(headers, "References");
-  if (refs && refs.length) return hashThreadId(refs[0]!);
-  const irt = asMessageIds(headers, "In-Reply-To");
-  if (irt && irt.length) return hashThreadId(irt[0]!);
-  const own = asMessageIds(headers, "Message-ID");
-  if (own && own.length) return hashThreadId(own[0]!);
-  if (envelopeMessageId) return hashThreadId(envelopeMessageId);
-  return null;
+  return threadIdFromInputs(threadInputs(headers), envelopeMessageId);
 }
 
 function hashThreadId(messageId: string): string {
