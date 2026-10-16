@@ -75,10 +75,13 @@ Changes from upstream:
     fetched alike and across all its mailboxes (later messages get none);
     the cache's message rows are read without their header blobs, which are
     loaded one at a time within that budget and only when asked for. Email/get
-    also refuses more ids than the advertised `maxObjectsInGet`, answers a
-    repeated id once (RFC 8620 §5.1), and email and mailbox ids must be in
-    the canonical encoding the proxy issues, so one message can't be named
-    (and fetched and projected) many times over. Threading
+    also refuses more ids than the advertised `maxObjectsInGet` and answers a
+    repeated id once (RFC 8620 §5.1). Email and mailbox ids must be in the
+    canonical encoding the proxy issues, and an id is only found when it is
+    exactly the id of the message it resolves to (same account and live
+    UIDVALIDITY), so one message can't be named, fetched and projected many
+    times over. All `headers` / `header:*` values one Email/get emits share a
+    16 Mi-character allowance; past it the call fails with `requestTooLarge`. Threading
     inputs are derived once per message and cached with it
     (`email_cache.thread_inputs`, first writer wins within one UIDVALIDITY;
     a reused UID under a new UIDVALIDITY replaces the whole row), so Email/get

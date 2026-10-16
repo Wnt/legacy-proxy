@@ -435,3 +435,56 @@ describe("review round 4: one message, one result", () => {
     rmSync(d, { recursive: true, force: true });
   });
 });
+
+describe("review round 5: ids and projections", () => {
+  const LONG = `X-LongValue: ${"v".repeat(200_000)}\r\n`;
+  const BLOCK = Buffer.from(`References: <root@example.test>\r\nSubject: s\r\n${LONG}\r\n`);
+
+  function ctxFor(s: Store) {
+    const client = {
+      mailbox: { uidValidity: 1n, exists: 1 },
+      getMailboxLock: async () => ({ release() {} }),
+      async *fetch(_range: string, query: any) {
+        if (query.bodyParts) yield { uid: 7, headers: BLOCK.subarray(0, query.bodyParts[0].maxLength) };
+        else if (query.headers) yield { uid: 7, headers: BLOCK };
+        else if (query.flags && !query.envelope) yield { uid: 7, flags: new Set() };
+        else yield { uid: 7, flags: new Set(), size: BLOCK.length + 10, internalDate: new Date(0),
+          envelope: { messageId: "<own@example.test>" }, bodyStructure: { part: "1", type: "text/plain", encoding: "7bit", size: 1 } };
+      },
+    };
+    return { account: s.getAccountById(1)!, client, store: s } as never;
+  }
+
+  it.each(["uidvalidity", "accountIdx"])("canonical ids differing only in %s give one result", async (field) => {
+    const { emailGet } = await import("../../src/jmap/methods/email.js");
+    const { encodeEmailId } = await import("../../src/mapping/ids.js");
+    const real = { accountIdx: 1, mailboxIdx: 2, uidvalidity: 1, uid: 7 };
+    const ids = Array.from({ length: 40 }, (_, i) => encodeEmailId({ ...real, [field]: i + 1 }));
+    const d = mkdtempSync(path.join(tmpdir(), "hdrfetch-"));
+    const s = seededStore(d);
+    const res = await emailGet({ accountId: "1", ids, properties: ["id", "headers"] }, ctxFor(s));
+    expect(res.list.map((e) => e.id)).toEqual([encodeEmailId(real)]);
+    expect(res.notFound).toHaveLength(39);
+    s.db.close();
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("refuses header projections past the request's allowance, however they are spelled", async () => {
+    const { emailGet } = await import("../../src/jmap/methods/email.js");
+    const { encodeEmailId } = await import("../../src/mapping/ids.js");
+    const id = encodeEmailId({ accountIdx: 1, mailboxIdx: 2, uidvalidity: 1, uid: 7 });
+    const d = mkdtempSync(path.join(tmpdir(), "hdrfetch-"));
+    const s = seededStore(d);
+    const variants = Array.from({ length: 160 }, (_, i) =>
+      "header:" + [..."x-longvalue"].map((c, j) => ((i >> (j % 8)) & 1 ? c.toUpperCase() : c)).join("") + (i >= 128 ? ":asRaw" : ""));
+    await expect(emailGet({ accountId: "1", ids: [id], properties: ["id", ...variants] }, ctxFor(s)))
+      .rejects.toMatchObject({ type: "requestTooLarge" });
+    // Ordinary distinct projections still work.
+    const ok = await emailGet({ accountId: "1", ids: [id],
+      properties: ["id", "headers", "header:Subject:asText", "header:X-LongValue", "header:References:asMessageIds"] }, ctxFor(s));
+    expect(ok.list[0]!["header:Subject:asText"]).toBe("s");
+    expect(ok.list[0]!["header:References:asMessageIds"]).toEqual(["root@example.test"]);
+    s.db.close();
+    rmSync(d, { recursive: true, force: true });
+  });
+});

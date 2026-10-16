@@ -834,6 +834,10 @@ export async function emailGet(
       notFound.push(id);
       continue;
     }
+    if (parts.accountIdx !== ctx.account.id) {
+      notFound.push(id);
+      continue;
+    }
     let g = groups.get(parts.mailboxIdx);
     if (!g) {
       g = { mailboxIdx: parts.mailboxIdx, entries: [] };
@@ -878,11 +882,18 @@ export async function emailGet(
     });
     for (const e of group.entries) {
       const meta = fetched.get(e.uid);
-      if (meta) list.push(meta);
+      // The message found must be the one the id names: its id is built from
+      // the live UIDVALIDITY, so an id with another epoch (or any other
+      // spelling of the same UID) is notFound, and each message is listed once.
+      if (meta && meta.id === e.id) list.push(meta);
       else notFound.push(e.id);
     }
   }
-  const projected = list.map((e) => projectEmailForGet(e, args.properties));
+  // Header projections are bounded per request like the blocks they come
+  // from: every emitted `headers` / `header:*` value draws on one allowance.
+  const projectionBudget = { remaining: MAX_FULL_HEADER_BYTES_PER_CALL };
+  const properties = args.properties ? [...new Set(args.properties)] : undefined;
+  const projected = list.map((e) => projectEmailForGet(e, properties, projectionBudget));
   return {
     accountId: args.accountId,
     state,
@@ -898,7 +909,18 @@ export async function emailGet(
 function projectEmailForGet(
   email: JmapEmail,
   properties: string[] | undefined,
+  budget: { remaining: number } = { remaining: MAX_FULL_HEADER_BYTES_PER_CALL },
 ): Record<string, unknown> {
+  const charge = <T>(value: T): T => {
+    budget.remaining -= projectedChars(value);
+    if (budget.remaining < 0) {
+      throw new JmapError(
+        "requestTooLarge",
+        `header projections exceed ${MAX_FULL_HEADER_BYTES_PER_CALL} characters; request fewer ids or header properties`,
+      );
+    }
+    return value;
+  };
   const headers = email._headers;
   // Default property set per RFC 8621 §4.2 Email/get if the client doesn't
   // pick one. We mirror the upstream test suite's expectations here — id is
@@ -914,11 +936,11 @@ function projectEmailForGet(
   for (const p of props) {
     if (p === "id") continue;
     if (p.startsWith("header:")) {
-      out[p] = projectHeaderProp(headers, p);
+      out[p] = charge(projectHeaderProp(headers, p));
       continue;
     }
     if (p === "headers") {
-      out.headers = headersToEmailHeaders(headers);
+      out.headers = charge(headersToEmailHeaders(headers));
       continue;
     }
     // Plain top-level property; copy through if we have it.
@@ -927,6 +949,19 @@ function projectEmailForGet(
     }
   }
   return out;
+}
+
+// Characters of the strings in a projected header value (names included):
+// what it adds to the response, give or take JSON punctuation.
+function projectedChars(v: unknown): number {
+  if (typeof v === "string") return v.length;
+  if (Array.isArray(v)) return v.reduce((n: number, x) => n + projectedChars(x) + 2, 0);
+  if (v && typeof v === "object") {
+    let n = 0;
+    for (const [k, x] of Object.entries(v)) n += k.length + projectedChars(x) + 2;
+    return n;
+  }
+  return 4;
 }
 
 // Account-wide email state used by Email/get and Email/set. Bumped by Email/set
