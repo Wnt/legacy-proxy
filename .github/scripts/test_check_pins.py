@@ -62,6 +62,42 @@ class DockerfileTests(unittest.TestCase):
         self.assertEqual(check_dockerfile(f"FROM n@{D}\nRUN npm ci && npx playwright install\n"), [])
 
 
+    def test_npm_install_forms(self):
+        for run in ('RUN ["npm", "install", "--omit=dev"]', "RUN npm --prefix /app install",
+                    "RUN cd /app; /usr/local/bin/npm isntall", "RUN npm ci || npm add x"):
+            self.assertEqual(len(check_dockerfile(f"FROM n@{D}\n{run}\n")), 1, run)
+        for run in ('RUN ["npm", "ci"]', "RUN npm uninstall -g npm && npx playwright install",
+                    "RUN npm run install-deps"):
+            self.assertEqual(check_dockerfile(f"FROM n@{D}\n{run}\n"), [], run)
+
+    def test_escape_directive_refused(self):
+        text = f"# escape=`\nFROM node:24@{D}\nRUN echo \\\nFROM node:24\n"
+        self.assertTrue(check_dockerfile(text))
+        self.assertEqual(check_dockerfile(f"# escape=\\\nFROM node@{D}\n"), [])
+
+    def test_heredoc_and_onbuild_refused(self):
+        self.assertEqual(len(check_dockerfile(f"FROM n@{D}\nRUN <<EOF\nnpm install\nEOF\n")), 1)
+        self.assertEqual(len(check_dockerfile(f"FROM n@{D}\nONBUILD RUN true\n")), 1)
+
+    def test_copy_from_and_mount_from(self):
+        bad = ("COPY --from=busybox:latest /bin/sh /sh",
+               "RUN --mount=type=bind,from=busybox:latest,target=/b true",
+               "ADD --chown=1 --from=alpine /a /b")
+        for line in bad:
+            self.assertEqual(len(check_dockerfile(f"FROM n@{D} AS build\n{line}\n")), 1, line)
+        good = ("COPY --from=build /a /b", "COPY --from=0 /a /b", f"COPY --from=busybox:1@{D} /a /b",
+                "RUN --mount=type=cache,target=/root/.npm npm ci",
+                "RUN --mount=type=bind,from=build,target=/b true")
+        for line in good:
+            self.assertEqual(check_dockerfile(f"FROM n@{D} AS build\n{line}\n"), [], line)
+
+    def test_add_remote(self):
+        self.assertEqual(len(check_dockerfile(f"FROM n@{D}\nADD https://x/y.tgz /y\n")), 1)
+        self.assertEqual(len(check_dockerfile(f"FROM n@{D}\nADD git@github.com:o/r.git /r\n")), 1)
+        self.assertEqual(check_dockerfile(f"FROM n@{D}\nADD --checksum=sha256:{'c' * 64} https://x/y /y\n"), [])
+        self.assertEqual(check_dockerfile(f"FROM n@{D}\nADD local.tgz /y\n"), [])
+
+
 class ShellTests(unittest.TestCase):
     def test_image_assignments(self):
         bad = ('PW_IMAGE="mcr.microsoft.com/playwright:v1.59.1-noble"', "export IMAGE=node:24",
@@ -99,6 +135,18 @@ class WorkflowTests(unittest.TestCase):
     def test_flow_style_is_reported(self):
         self.assertEqual(len(check_workflow("steps: [{uses: actions/checkout@v4}]\n")), 1)
 
+    def test_escaped_quoted_key_refused(self):
+        self.assertEqual(len(check_workflow('  - "u\\u0073es": actions/checkout@v7\n')), 1)
+
+    def test_image_keys(self):
+        for v in ("node:24", "docker://alpine:latest", "'ghcr.io/o/r:1'", "${{ matrix.image }}"):
+            self.assertEqual(len(check_workflow(f"    container:\n      image: {v}\n")), 1, v)
+        for v in (f"node:24@{D}", f"docker://alpine:3@{D}", "Dockerfile", "./docker/Dockerfile", ""):
+            self.assertEqual(check_workflow(f"    image: {v}\n"), [], v)
+
+    def test_local_action_must_exist(self):
+        self.assertEqual(len(check_workflow("  - uses: ./missing\n", lambda ref: False)), 1)
+
     def test_reusable_workflow(self):
         self.assertEqual(len(check_workflow("jobs:\n  a:\n    uses: o/r/.github/workflows/x.yml@v1\n")), 1)
         self.assertEqual(check_workflow(f"jobs:\n  a:\n    uses: o/r/.github/workflows/x.yml@{SHA}\n"), [])
@@ -130,8 +178,20 @@ class DiscoveryTests(unittest.TestCase):
                       {"x/app.dockerfile": "FROM node\n"},
                       {".github/workflows/b.yaml": "- uses: o/r@v1\n"},
                       {".github/actions/x/action.yml": "runs:\n  steps:\n    - uses: o/r@v1\n"},
-                      {"integration/run.sh": 'PW_IMAGE="mcr.microsoft.com/playwright:v1-noble"\n'}):
+                      {"integration/run.sh": 'PW_IMAGE="mcr.microsoft.com/playwright:v1-noble"\n'},
+                      {".github/workflows/c.yml": "- uses: ./actions/local\n",
+                       "actions/local/action.yml": "runs:\n  steps:\n    - uses: actions/checkout@v7\n"},
+                      {".github/workflows/c.yml": "- uses: ./actions/docker\n",
+                       "actions/docker/action.yml": "runs:\n  using: docker\n  image: 'docker://alpine:latest'\n"},
+                      {".github/workflows/c.yml": "- uses: ./actions/none\n"}):
             self.assertEqual(self.run_main({**good, **extra}), 1, extra)
+
+    def test_local_actions_pass_when_pinned(self):
+        files = {"Dockerfile": f"FROM a@{D}\n",
+                 ".github/workflows/a.yml": "- uses: ./actions/x\n- uses: ./.github/workflows/r.yml\n",
+                 ".github/workflows/r.yml": f"- uses: o/r@{SHA}\n",
+                 "actions/x/action.yml": f"runs:\n  using: docker\n  image: docker://alpine:3@{D}\n"}
+        self.assertEqual(self.run_main(files), 0)
 
     def test_empty_repo_fails(self):
         self.assertEqual(self.run_main({"README": "x"}), 1)

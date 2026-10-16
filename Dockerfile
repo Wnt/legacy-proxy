@@ -17,11 +17,6 @@
 # the tag and digest together: docker buildx imagetools inspect <image>:<tag>
 FROM node:22.23.3-alpine3.24@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS build
 WORKDIR /app
-# apk packages (here and in the runtime stage) come from the pinned base
-# image's Alpine release branch and are verified against the signing keys
-# inside that pinned image. They are not version-pinned: Alpine drops
-# superseded versions from its mirrors, which would break rebuilds.
-RUN apk add --no-cache python3 make g++ sqlite-dev
 COPY package.json package-lock.json tsconfig.json ./
 # This stage only runs tsc, so no dependency lifecycle script runs here
 # (esbuild's and better-sqlite3's install scripts can fetch binaries outside
@@ -35,6 +30,11 @@ WORKDIR /app
 ENV NODE_ENV=production \
     DATA_DIR=/data \
     PORT=8080
+# apk packages here come from the pinned base image's Alpine release branch and
+# are verified against the signing keys inside that pinned image. They are not
+# version-pinned: Alpine drops superseded versions from its mirrors, which would
+# break rebuilds. Residual of audit deploy-4, for the owner to accept or to
+# replace with a reviewed package snapshot.
 RUN apk add --no-cache sqlite-libs tini \
  && addgroup -S proxy \
  && adduser -S proxy -G proxy \
