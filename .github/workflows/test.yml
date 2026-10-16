@@ -16,16 +16,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build inputs are pinned
+        # Every Dockerfile FROM/syntax image is tag@sha256:<digest> and every
+        # action is a full commit SHA (audit deploy-4); see the script header.
+        run: |
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+          python3 .github/scripts/check_pins.py
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
 
       - name: Install
-        run: npm ci --no-audit --no-fund
+        # No dependency lifecycle scripts (esbuild's and better-sqlite3's can
+        # fetch binaries outside the lockfile). esbuild runs from its locked
+        # platform package; better-sqlite3 is compiled from its locked tarball
+        # against the installed Node's headers.
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm_config_build_from_source=better-sqlite3 \
+          npm_config_nodedir="$(dirname "$(dirname "$(command -v node)")")" \
+            npm rebuild better-sqlite3
 
       - name: Typecheck
         run: npm run lint
