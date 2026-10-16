@@ -21,7 +21,9 @@ export function decodeMailboxId(id: string): MailboxIdParts {
   const a = varintDecode(buf, 0);
   const m = varintDecode(buf, a.next);
   if (m.next !== buf.length) throw new Error("decodeMailboxId: trailing bytes");
-  return { accountIdx: a.value, mailboxIdx: m.value };
+  const parts = { accountIdx: a.value, mailboxIdx: m.value };
+  if (encodeMailboxId(parts) !== id) throw new Error("decodeMailboxId: not canonical");
+  return parts;
 }
 
 export function encodeEmailId(p: EmailIdParts): string {
@@ -42,7 +44,12 @@ export function decodeEmailId(id: string): EmailIdParts {
   const v = varintDecode(buf, m.next);
   const u = varintDecode(buf, v.next);
   if (u.next !== buf.length) throw new Error("decodeEmailId: trailing bytes");
-  return { accountIdx: a.value, mailboxIdx: m.value, uidvalidity: v.value, uid: u.value };
+  const parts = { accountIdx: a.value, mailboxIdx: m.value, uidvalidity: v.value, uid: u.value };
+  // One message, one id: an encoding we would not have issued (padded
+  // varints, other base64 spellings) is not an id of ours. Otherwise many
+  // strings could name one message and slip past per-id deduplication.
+  if (encodeEmailId(parts) !== id) throw new Error("decodeEmailId: not canonical");
+  return parts;
 }
 
 export function encodeBlobId(emailId: string, partId?: string): string {

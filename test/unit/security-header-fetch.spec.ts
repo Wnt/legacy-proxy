@@ -387,3 +387,51 @@ describe("review round 3", () => {
     await expect(emailGet({ accountId: "1", ids: ["a", "b", "c", "d"] }, ctx)).rejects.toMatchObject({ type: "requestTooLarge" });
   });
 });
+
+describe("review round 4: one message, one result", () => {
+  const LARGE = Buffer.from(`References: <root@example.test>\r\n${FILLER}\r\n`, "latin1").subarray(0, MAX_HEADER_BLOCK_BYTES);
+
+  function ctxFor(s: Store) {
+    const client = {
+      mailbox: { uidValidity: 1n, exists: 1 },
+      getMailboxLock: async () => ({ release() {} }),
+      async *fetch(_range: string, query: any) {
+        if (query.bodyParts) yield { uid: 7, headers: LARGE.subarray(0, query.bodyParts[0].maxLength) };
+        else if (query.headers) yield { uid: 7, headers: LARGE };
+        else if (query.flags && !query.envelope) yield { uid: 7, flags: new Set() };
+        else yield { uid: 7, flags: new Set(), size: LARGE.length * 2, internalDate: new Date(0),
+          envelope: { messageId: "<own@example.test>" }, bodyStructure: { part: "1", type: "text/plain", encoding: "7bit", size: 1 } };
+      },
+    };
+    return { account: s.getAccountById(1)!, client, store: s } as never;
+  }
+
+  // The same message (account 1, mailbox 2, UIDVALIDITY 1, UID 7) spelled with
+  // padded varints: a valid decode, but not an id the server ever issued.
+  function aliases(n: number): string[] {
+    const out: string[] = [];
+    for (let pad = 0; pad < n; pad++) {
+      const one = [...Array(pad).fill(0x80).map((_, i) => (i === 0 ? 0x81 : 0x80)), ...(pad ? [0x00] : [0x01])];
+      out.push(Buffer.from([...one, 0x02, 0x01, 0x07]).toString("base64url"));
+    }
+    return out;
+  }
+
+  it.each(["repeated", "aliased"])("%s ids are fetched and projected once", async (kind) => {
+    const { emailGet } = await import("../../src/jmap/methods/email.js");
+    const { encodeEmailId } = await import("../../src/mapping/ids.js");
+    const id = encodeEmailId({ accountIdx: 1, mailboxIdx: 2, uidvalidity: 1, uid: 7 });
+    const d = mkdtempSync(path.join(tmpdir(), "hdrfetch-"));
+    const s = seededStore(d);
+    const ids = kind === "repeated" ? Array(40).fill(id) : [id, ...aliases(39).slice(1)];
+    const res = await emailGet({ accountId: "1", ids, properties: ["id", "headers", "threadId"] }, ctxFor(s));
+    expect(res.list).toHaveLength(1);
+    expect(res.list[0]!.id).toBe(id);
+    const chars = (res.list as { headers: { name: string; value: string }[] }[])
+      .flatMap((e) => e.headers).reduce((n, h) => n + h.name.length + h.value.length, 0);
+    expect(chars).toBeLessThanOrEqual(MAX_FULL_HEADER_BYTES_PER_CALL);
+    if (kind === "aliased") expect(res.notFound).toHaveLength(38);
+    s.db.close();
+    rmSync(d, { recursive: true, force: true });
+  });
+});

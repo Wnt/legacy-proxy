@@ -824,7 +824,9 @@ export async function emailGet(
   // typically request many ids in the same mailbox.
   type Group = { mailboxIdx: number; entries: { id: string; uid: number }[] };
   const groups = new Map<number, Group>();
-  for (const id of args.ids) {
+  // RFC 8620 §5.1: an id given more than once is answered once. Ids are
+  // canonical (decodeEmailId), so one message is fetched and projected once.
+  for (const id of new Set(args.ids)) {
     let parts;
     try {
       parts = decodeEmailId(id);

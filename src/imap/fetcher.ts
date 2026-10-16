@@ -508,6 +508,8 @@ export async function fetchEmailsBatch(
   store?: Store,
 ): Promise<Map<number, JmapEmail>> {
   const out = new Map<number, JmapEmail>();
+  // Each message once, whatever the caller passed: everything below is per UID.
+  uids = [...new Set(uids)];
   if (uids.length === 0) return out;
   const needsFull = bodyOpts.needsFullHeaders === true;
   const budget = bodyOpts.headerBudget ?? { remaining: MAX_FULL_HEADER_BYTES_PER_CALL };
