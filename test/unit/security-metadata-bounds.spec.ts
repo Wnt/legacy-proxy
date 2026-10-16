@@ -215,9 +215,43 @@ describe("final review quick fixes", () => {
       mailboxIds: { [encodeMailboxId({ accountIdx: 1, mailboxIdx: 2 })]: true },
       bodyValues: { "1": { value: "hi" } }, textBody: [{ partId: "1" }],
       attachments: [{ blobId, type: "application/pdf" }],
-    } } }, { account: store.getAccountById(1)!, client, store, budgets } as never);
-    expect(res.created).toBeNull();
+    } } }, { account: store.getAccountById(1)!, client, store, budgets } as never).catch((e) => e);
+    // Either the create failed or the whole call stopped; nothing was stored.
+    expect((res as { created?: unknown }).created ?? null).toBeNull();
     expect(appendSpy.called).toBe(false);
     expect(chunksRead).toBeLessThan(5);
+  });
+});
+
+describe("post-merge review quick fixes", () => {
+  it("equivalent header property spellings are projected once and answered under each key", async () => {
+    const block = Array.from({ length: 20_000 }, () => "X-Repeated: <a@x>").join("\r\n") + "\r\n\r\n";
+    const id = encodeEmailId({ accountIdx: 1, mailboxIdx: 2, uidvalidity: 1, uid: 7 });
+    const props = Array.from({ length: 128 }, (_, i) =>
+      "header:" + [..."x-repeated"].map((c, j) => ((i >> (j % 7)) & 1 ? c.toUpperCase() : c)).join("") + ":asMessageIds");
+    const uniq = [...new Set(props)];
+    const t = performance.now();
+    const res = await emailGet({ accountId: "1", ids: [id], properties: ["id", ...uniq] },
+      { account: store.getAccountById(1)!, client: server({ subject: "s" }, undefined, block), store, budgets: newRequestBudgets() } as never);
+    expect(performance.now() - t).toBeLessThan(3000);
+    const values = uniq.map((p) => JSON.stringify(res.list[0]![p]));
+    expect(new Set(values).size).toBe(1);
+  });
+
+  it("an abandoned Email/set does no further mutations", async () => {
+    const { emailSet } = await import("../../src/jmap/methods/email.js");
+    const ac = new AbortController();
+    ac.abort();
+    let deleted = false;
+    const client = {
+      mailbox: { uidValidity: 1n },
+      getMailboxLock: async () => ({ release() {} }),
+      messageDelete: async () => ((deleted = true), true),
+    };
+    const id = encodeEmailId({ accountIdx: 1, mailboxIdx: 2, uidvalidity: 1, uid: 7 });
+    await expect(emailSet({ accountId: "1", destroy: [id] },
+      { account: store.getAccountById(1)!, client, store, budgets: { ...newRequestBudgets(), signal: ac.signal } } as never))
+      .rejects.toMatchObject({ type: "serverFail" });
+    expect(deleted).toBe(false);
   });
 });

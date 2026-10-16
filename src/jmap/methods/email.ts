@@ -1009,6 +1009,16 @@ function projectEmailForGet(
     const name = /^header:([^:]+)/.exec(prop)?.[1]?.toLowerCase() ?? "";
     return byName.get(name) ?? [];
   };
+  // Equivalent spellings (case of the name and form, a default :asRaw) are
+  // computed once per message and reused under each requested key.
+  const projections = new Map<string, unknown>();
+  const project = (prop: string): unknown => {
+    const m = /^header:([^:]+)((?::[A-Za-z]+)*)$/.exec(prop);
+    const mods = (m?.[2] ?? "").toLowerCase().split(":").filter(Boolean);
+    const key = `${(m?.[1] ?? prop).toLowerCase()}:${mods[0] && mods[0] !== "all" ? mods[0] : "asraw"}${mods.includes("all") ? ":all" : ""}`;
+    if (!projections.has(key)) projections.set(key, projectHeaderProp(headersNamed(prop), prop));
+    return projections.get(key);
+  };
   // Default property set per RFC 8621 §4.2 Email/get if the client doesn't
   // pick one. We mirror the upstream test suite's expectations here — id is
   // always present; everything else is included by default.
@@ -1025,7 +1035,7 @@ function projectEmailForGet(
     // The key goes out too, escaped.
     budgets.response.remaining -= Buffer.byteLength(JSON.stringify(p));
     if (p.startsWith("header:")) {
-      out[p] = emit(projectHeaderProp(headersNamed(p), p), true);
+      out[p] = emit(project(p), true);
       continue;
     }
     if (p === "headers") {
@@ -1118,7 +1128,13 @@ export async function emailSet(
     }
   }
 
+  // A client that went away gets no further mutations done in its name.
+  const stopIfAborted = () => {
+    if (ctx.budgets?.signal?.aborted) throw new JmapError("serverFail", "request aborted by the client");
+  };
+  stopIfAborted();
   await applyEmailUpdatesBatched(args.update ?? {}, ctx, { updated, notUpdated, touchedMailboxes });
+  stopIfAborted();
   await applyEmailDestroysBatched(args.destroy ?? [], ctx, { destroyed, notDestroyed, touchedMailboxes });
 
   const mutated =

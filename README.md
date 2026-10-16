@@ -129,7 +129,8 @@ Changes from upstream:
     moved, so the thread index is rebuilt. Invalid `header:` property names
     are refused rather than echoed, at most 128 `header:*` properties are
     answered per Email/get (from a per-message index of header names), and
-    Email/query keeps only lower-cased 256-character sort keys per hit. A
+    Email/query keeps only lower-cased 256-character sort keys per hit
+    (values equal in their first 256 characters sort as equal). A
     message's cached threadId is reused, so Email/get and the thread scan
     report the same one. A client that disconnects stops its request: it
     leaves the per-account queue, and Email/get and draft creation stop at
