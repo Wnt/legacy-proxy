@@ -74,6 +74,17 @@ export async function withMailbox<T>(
   }
 }
 
+/**
+ * UIDVALIDITY of the mailbox currently selected on `client`, or null when none
+ * is. A UID only names a message together with this value: after a mailbox is
+ * recreated or restored (new UIDVALIDITY) the same UID can be another message.
+ */
+export function selectedUidValidity(client: ImapFlow): number | null {
+  const mb = client.mailbox && typeof client.mailbox === "object" ? client.mailbox : null;
+  const v = (mb as { uidValidity?: number | bigint } | null)?.uidValidity;
+  return v == null ? null : Number(v);
+}
+
 // The server's side of a failed IMAP command. imapflow puts the tagged NO/BAD
 // text on the error object; without it the log only says "Command failed".
 export function imapErrorDetails(e: unknown): Record<string, unknown> {

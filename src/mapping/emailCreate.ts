@@ -133,6 +133,11 @@ function checkPart(part: unknown, prop: string, depth: number, count: { n: numbe
   optHeaderList(part.headers, prop);
   if (part.subParts !== undefined && part.subParts !== null) {
     if (!Array.isArray(part.subParts)) fail(prop, "subParts must be a list");
+    // Only a multipart part has children; anything else would silently drop them.
+    const type = typeof part.type === "string" ? part.type : "text/plain";
+    if (part.subParts.length > 0 && !type.toLowerCase().startsWith("multipart/")) {
+      fail(prop, "subParts are only allowed on multipart/* parts");
+    }
     for (const child of part.subParts) checkPart(child, prop, depth + 1, count);
   }
 }

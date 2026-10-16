@@ -86,6 +86,59 @@ export async function* headerBlocksBounded(
 // values; their threading is unaffected, it comes from ThreadInputs.
 export const MAX_FULL_HEADER_BYTES_PER_CALL = 16 * 1024 * 1024;
 
+/**
+ * What one HTTP request's Email/get calls may fetch and emit, together: body
+ * bytes fetched, full header blocks held, header characters projected, and
+ * response characters overall.
+ * Created per request (makeLegacyMethods), so neither several mailboxes in
+ * one call nor several calls in one request multiply the limits.
+ */
+export interface RequestBudgets {
+  body: { remaining: number };
+  header: { remaining: number };
+  projection: { remaining: number };
+  response: { remaining: number };
+  // ENVELOPE + BODYSTRUCTURE JSON characters held for this request's messages.
+  metadata: { remaining: number };
+  // Set when the client went away: work stops at the next check.
+  signal?: AbortSignal;
+}
+
+/** A RequestBudgets allowance ran out (or the request was abandoned). */
+export class BudgetExceededError extends Error {}
+
+export function checkAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new BudgetExceededError("request aborted by the client");
+}
+
+function chargeMetadata(budget: { remaining: number } | undefined, chars: number): void {
+  if (!budget) return;
+  budget.remaining -= chars;
+  if (budget.remaining < 0) {
+    throw new BudgetExceededError(`message metadata exceeds ${MAX_METADATA_CHARS} characters for one request`);
+  }
+}
+
+// Message metadata (ENVELOPE, BODYSTRUCTURE) one request may hold. Each
+// message's is at most ~192 KiB once bounded; typical mail is a few KB.
+export const MAX_METADATA_CHARS = 64 * 1024 * 1024;
+
+export function newRequestBudgets(): RequestBudgets {
+  return {
+    body: { remaining: MAX_BODY_FETCH_BYTES },
+    header: { remaining: MAX_FULL_HEADER_BYTES_PER_CALL },
+    projection: { remaining: MAX_FULL_HEADER_BYTES_PER_CALL },
+    response: { remaining: MAX_RESPONSE_CHARS },
+    metadata: { remaining: MAX_METADATA_CHARS },
+  };
+}
+
+// Characters of Email objects all Email/get calls of one request may return,
+// every property counted (body values and header projections included).
+// Well above a large thread with full bodies; a request past it fails with
+// requestTooLarge rather than piling up responses.
+export const MAX_RESPONSE_CHARS = 64 * 1024 * 1024;
+
 export interface JmapEmail {
   id: string;
   blobId: string;
@@ -135,6 +188,12 @@ export interface BodyFetchOpts {
   // fetched blocks both draw on it; a message past it is answered without
   // `headers`/`header:*` values. Defaults to a fresh MAX_FULL_HEADER_BYTES_PER_CALL.
   headerBudget?: { remaining: number };
+  // Likewise for body values: bytes still fetchable in this request, shared
+  // by every mailbox group (and every Email/get of one HTTP request).
+  // Defaults to a fresh MAX_BODY_FETCH_BYTES.
+  bodyBudget?: { remaining: number };
+  metadataBudget?: { remaining: number };
+  signal?: AbortSignal;
 }
 
 function decodePartText(buf: Buffer, charset: string | null): string {
@@ -208,6 +267,107 @@ function buildPreview(text: string, isHtml: boolean): string {
 // Envelope as imapflow parses it. When rehydrated from the cache the Date
 // fields come back as ISO strings — every consumer feeds them to `new Date()`,
 // which accepts both.
+// The server parses ENVELOPE and BODYSTRUCTURE from what the sender wrote, so
+// their size is the sender's choice. Each is cut down as it arrives, before
+// the next message is read, to what a client can use.
+const MAX_ENVELOPE_SUBJECT_CHARS = 16 * 1024;
+const MAX_META_STRING_CHARS = 998; // a header line
+const MAX_META_ID_CHARS = 1000; // a msg-id with its brackets; longer is no id
+export const MAX_ENVELOPE_JSON_CHARS = 64 * 1024;
+export const MAX_BODYSTRUCTURE_JSON_CHARS = 128 * 1024;
+const MAX_BODYSTRUCTURE_PARTS = 256;
+const MAX_BODYSTRUCTURE_DEPTH = 16;
+
+type Addr = { name?: string | null; address?: string | null };
+
+export function boundEnvelope(env: EnvelopeLike | null | undefined): EnvelopeLike | null {
+  if (!env || typeof env !== "object") return null;
+  const str = (v: unknown, n: number) => (typeof v === "string" ? v.slice(0, n) : undefined);
+  // An overlong Message-ID / In-Reply-To is not shortened into a new id (that
+  // would invent a thread the scan doesn't see): it is dropped, as the
+  // threading code drops it.
+  const id = (v: unknown) => (typeof v === "string" && v.length <= MAX_META_ID_CHARS ? v : undefined);
+  const list = (l: unknown, max: number): Addr[] | undefined =>
+    Array.isArray(l)
+      ? (l as Addr[]).slice(0, max).map((a) => ({
+          name: typeof a?.name === "string" ? a.name.slice(0, MAX_META_STRING_CHARS) : null,
+          address: typeof a?.address === "string" ? a.address.slice(0, MAX_META_STRING_CHARS) : null,
+        }))
+      : undefined;
+  const build = (maxAddrs: number, subjectChars: number): EnvelopeLike => ({
+    date: env.date instanceof Date ? env.date : str(env.date, MAX_META_STRING_CHARS),
+    subject: str(env.subject, subjectChars),
+    messageId: id(env.messageId),
+    inReplyTo: id(env.inReplyTo),
+    sender: list(env.sender, maxAddrs),
+    from: list(env.from, maxAddrs),
+    to: list(env.to, maxAddrs),
+    cc: list(env.cc, maxAddrs),
+    bcc: list(env.bcc, maxAddrs),
+    replyTo: list(env.replyTo, maxAddrs),
+  });
+  // A hard bound on the serialized size (escapes included): fewer addresses
+  // first, then a shorter subject; the last resort has neither.
+  for (let maxAddrs = 1000, subject = MAX_ENVELOPE_SUBJECT_CHARS; ; ) {
+    const out = build(maxAddrs, subject);
+    if (jsonSize(out) <= MAX_ENVELOPE_JSON_CHARS) return out;
+    if (maxAddrs > 0) maxAddrs = Math.floor(maxAddrs / 2);
+    else if (subject > 0) subject = Math.floor(subject / 2);
+    else return out; // ids, date and empty fields only: a few KB at most
+  }
+}
+
+function jsonSize(v: unknown): number {
+  return Buffer.byteLength(JSON.stringify(v) ?? "null");
+}
+
+const MAX_META_KEYS = 32; // parameters per map, keys per node
+const MAX_META_KEY_CHARS = 64;
+
+/**
+ * BODYSTRUCTURE in one bounded traversal: depth, part count, keys per object
+ * (and their length), and string length, then a hard bound on the serialized
+ * size. If even a reduced tree doesn't fit, only the root's type, size and
+ * encoding remain.
+ */
+export function boundBodyStructure(bs: unknown): unknown {
+  const build = (maxParts: number) => {
+    let parts = 0;
+    const node = (n: unknown, depth: number): unknown => {
+      if (typeof n === "string") return n.slice(0, MAX_META_STRING_CHARS);
+      if (Array.isArray(n)) return n.slice(0, MAX_META_KEYS).map((x) => node(x, depth));
+      if (!n || typeof n !== "object") return n;
+      const out: Record<string, unknown> = {};
+      let keys = 0;
+      for (const [k, v] of Object.entries(n as Record<string, unknown>)) {
+        if (k.length > MAX_META_KEY_CHARS || ++keys > MAX_META_KEYS) continue;
+        if (k === "childNodes") {
+          if (!Array.isArray(v) || depth >= MAX_BODYSTRUCTURE_DEPTH) continue;
+          const kids: unknown[] = [];
+          for (const c of v) {
+            if (++parts > maxParts) break;
+            kids.push(node(c, depth + 1));
+          }
+          out.childNodes = kids;
+        } else if (k === "envelope") {
+          out.envelope = boundEnvelope(v as EnvelopeLike);
+        } else {
+          out[k] = node(v, depth);
+        }
+      }
+      return out;
+    };
+    return node(bs, 0);
+  };
+  for (let max = MAX_BODYSTRUCTURE_PARTS; max >= 0; max = max === 0 ? -1 : Math.floor(max / 2)) {
+    const out = build(max);
+    if (jsonSize(out) <= MAX_BODYSTRUCTURE_JSON_CHARS) return out;
+  }
+  const root = (bs && typeof bs === "object" ? bs : {}) as Record<string, unknown>;
+  const scalar = (v: unknown) => (typeof v === "string" ? v.slice(0, MAX_META_STRING_CHARS) : typeof v === "number" ? v : undefined);
+  return { part: scalar(root.part), type: scalar(root.type), encoding: scalar(root.encoding), size: scalar(root.size) };
+}
+
 interface EnvelopeLike {
   date?: Date | string;
   subject?: string;
@@ -239,6 +399,9 @@ interface RawMeta {
   headersTruncated: boolean;
   // What threadId and `references` derive from, computed once per message.
   thread: ThreadInputs;
+  // The threadId already recorded for this message (scan or earlier get), if
+  // any: reused, so every path reports the decision made first.
+  cachedThreadId?: string | null;
   preview: string | null;
   fromCache: boolean;
 }
@@ -276,7 +439,7 @@ function rawFromFetch(
     flags: new Set(msg.flags ?? []),
     size: msg.size ?? 0,
     internaldate: msg.internalDate ? new Date(msg.internalDate).getTime() : Date.now(),
-    envelope: (msg.envelope as EnvelopeLike | undefined) ?? null,
+    envelope: msg.envelope as EnvelopeLike, // bounded when it was fetched
     bodystructure: msg.bodyStructure ?? null,
     headersRaw,
     headersFull: headersRaw !== null,
@@ -300,7 +463,8 @@ function processMeta(account: AccountRow, mailbox: MailboxRow, raw: RawMeta): Pr
   );
   const sel = selectBodies(root);
   const headers = raw.headersRaw ? parseHeaderBlock(raw.headersRaw) : [];
-  const threadId = threadIdFromInputs(raw.thread, raw.envelope?.messageId ?? null) ?? emailId;
+  const threadId =
+    raw.cachedThreadId ?? threadIdFromInputs(raw.thread, raw.envelope?.messageId ?? null) ?? emailId;
   return { raw, emailId, blobId, threadId, root, sel, headers };
 }
 
@@ -363,6 +527,43 @@ function wantedBodyParts(sel: ReturnType<typeof selectBodies>, opts: BodyFetchOp
   return wanted;
 }
 
+// Limits on body values. A client's maxBodyValueBytes is honoured up to
+// MAX_BODY_VALUE_BYTES (0, "no limit" in RFC 8621, also means that maximum).
+// Each part is fetched as a partial BODY[part]<0.N>, N the most encoded bytes
+// that can decode to the value's limit, so a sender's 100 MB text part costs
+// no more than the bytes we return. Per Email/get call, at most
+// MAX_BODY_FETCH_BYTES are fetched over all messages and parts (one budget
+// for the whole HTTP request, see RequestBudgets); values past that come back
+// empty with isTruncated, like any other cut value.
+const DEFAULT_BODY_VALUE_BYTES = 256_000;
+export const MAX_BODY_VALUE_BYTES = 4 * 1024 * 1024;
+export const MAX_BODY_FETCH_BYTES = 32 * 1024 * 1024;
+
+function bodyValueCap(requested: number | undefined): number {
+  if (requested === undefined || requested === null) return DEFAULT_BODY_VALUE_BYTES;
+  if (!Number.isFinite(requested) || requested <= 0) return MAX_BODY_VALUE_BYTES;
+  return Math.min(Math.floor(requested), MAX_BODY_VALUE_BYTES);
+}
+
+/**
+ * The most transfer-encoded bytes worth fetching for a value of `cap` decoded
+ * bytes, plus a little more so a longer part is recognisably longer. An
+ * estimate that falls short only shortens the value; isTruncated stays right.
+ */
+export function encodedCeiling(cap: number, encoding: string | null): number {
+  const want = cap + 4;
+  switch ((encoding ?? "").toLowerCase()) {
+    case "base64":
+      // 4 chars per 3 bytes, plus a line break every 64-76 chars.
+      return Math.ceil((Math.ceil(want / 3) * 4 * 66) / 64) + 64;
+    case "quoted-printable":
+      // At worst "=XX" per byte, plus a soft break ("=\r\n") per 76 chars.
+      return Math.ceil((want * 3 * 79) / 76) + 64;
+    default:
+      return want;
+  }
+}
+
 // Fetch bodyValues for many messages, batching one FETCH per distinct
 // part-id set instead of one FETCH per message. Sibling messages in a thread
 // almost always share the same MIME shape ("1" or "1.1"+"1.2"), so an open
@@ -372,39 +573,58 @@ async function fetchBodyValuesBatched(
   items: { uid: number; wanted: Map<string, EmailBodyPart> }[],
   opts: BodyFetchOpts,
 ): Promise<Map<number, JmapEmail["bodyValues"]>> {
-  const cap = opts.maxBodyValueBytes ?? 256_000;
+  const cap = bodyValueCap(opts.maxBodyValueBytes);
   const out = new Map<number, JmapEmail["bodyValues"]>();
-  const groups = new Map<string, { partIds: string[]; members: typeof items }>();
+  const groups = new Map<string, { parts: { partId: string; maxLength: number }[]; members: typeof items }>();
+  const budget = opts.bodyBudget ?? { remaining: MAX_BODY_FETCH_BYTES };
   for (const item of items) {
     if (item.wanted.size === 0) {
       out.set(item.uid, {});
       continue;
     }
-    const partIds = [...item.wanted.keys()].sort();
-    const key = partIds.join(",");
+    const parts = [...item.wanted.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([partId, part]) => ({ partId, maxLength: encodedCeiling(cap, part.encoding) }));
+    // What the server will actually send: the part's size from BODYSTRUCTURE
+    // when smaller than the ceiling.
+    const cost = parts.reduce((n, p) => {
+      const size = item.wanted.get(p.partId)!.size;
+      return n + (size > 0 ? Math.min(size, p.maxLength) : p.maxLength);
+    }, 0);
+    if (cost > budget.remaining) {
+      // Over the request's budget: answer without fetching.
+      const values: JmapEmail["bodyValues"] = {};
+      for (const partId of item.wanted.keys()) values[partId] = { value: "", isEncodingProblem: false, isTruncated: true };
+      out.set(item.uid, values);
+      continue;
+    }
+    budget.remaining -= cost;
+    const key = parts.map((p) => `${p.partId}<${p.maxLength}>`).join(",");
     let g = groups.get(key);
     if (!g) {
-      g = { partIds, members: [] };
+      g = { parts, members: [] };
       groups.set(key, g);
     }
     g.members.push(item);
   }
 
   for (const g of groups.values()) {
+    checkAborted(opts.signal);
     const byUid = new Map(g.members.map((m) => [m.uid, m]));
     const rawByUid = new Map<number, Map<string, Buffer>>();
     try {
       for await (const msg of fetchByUid(
         client,
         g.members.map((m) => m.uid),
-        { uid: true, bodyParts: g.partIds },
+        { uid: true, bodyParts: g.parts.map((p) => ({ key: p.partId, start: 0, maxLength: p.maxLength })) },
       )) {
         if (msg.uid != null && msg.bodyParts) rawByUid.set(msg.uid, msg.bodyParts);
       }
     } catch (e) {
       // fall through: members without raw parts get isEncodingProblem below
-      log.warn({ uids: g.members.map((m) => m.uid), partIds: g.partIds, ...imapErrorDetails(e) }, "body part FETCH failed");
+      log.warn({ uids: g.members.map((m) => m.uid), partIds: g.parts.map((p) => p.partId), ...imapErrorDetails(e) }, "body part FETCH failed");
     }
+    const ceiling = new Map(g.parts.map((p) => [p.partId, p.maxLength]));
     for (const m of g.members) {
       const bodyParts = rawByUid.get(m.uid);
       const values: JmapEmail["bodyValues"] = {};
@@ -415,8 +635,10 @@ async function fetchBodyValuesBatched(
           continue;
         }
         const decoded = decodeTransferEncoding(raw, part.encoding);
-        const truncated = decoded.length > cap;
-        const slice = truncated ? decoded.subarray(0, cap) : decoded;
+        // Cut short on the wire: the part is longer than what we fetched.
+        const cutOnWire = raw.length >= ceiling.get(partId)! && !(part.size > 0 && part.size <= raw.length);
+        const truncated = decoded.length > cap || cutOnWire;
+        const slice = decoded.length > cap ? decoded.subarray(0, cap) : decoded;
         values[partId] = {
           value: decodePartText(slice, part.charset),
           isEncodingProblem: false,
@@ -527,13 +749,19 @@ export async function fetchEmailsBatch(
     if (
       row &&
       thread &&
-      row.envelope !== null &&
-      row.bodystructure !== null &&
+      (row.envelope_len ?? 0) > 0 &&
+      (row.bodystructure_len ?? 0) > 0 &&
+      (row.envelope_len ?? 0) <= MAX_ENVELOPE_JSON_CHARS &&
+      (row.bodystructure_len ?? 0) <= MAX_BODYSTRUCTURE_JSON_CHARS &&
       (!needsFull || (row.headers_full === 1 && (row.headers_len ?? 0) > 0))
     ) {
       try {
-        const envelope = JSON.parse(row.envelope) as EnvelopeLike | null;
-        const bodystructure = JSON.parse(row.bodystructure);
+        // Sizes first, then this row's metadata only.
+        chargeMetadata(bodyOpts.metadataBudget, (row.envelope_len ?? 0) + (row.bodystructure_len ?? 0));
+        const meta = store!.getEmailCacheMeta(account.id, mailbox.id, mailbox.uidvalidity, uid);
+        if (!meta?.envelope || !meta.bodystructure) throw new Error("incomplete cache row");
+        const envelope = boundEnvelope(JSON.parse(meta.envelope) as EnvelopeLike | null);
+        const bodystructure = boundBodyStructure(JSON.parse(meta.bodystructure));
         // Rows written before the guards above can hold the string "null".
         if (!envelope || !bodystructure) throw new Error("incomplete cache row");
         let headersRaw: Buffer | null = null;
@@ -554,11 +782,13 @@ export async function fetchEmailsBatch(
           headersFull: full,
           headersTruncated: row.headers_truncated === 1,
           thread,
+          cachedThreadId: row.thread_id,
           preview: row.preview,
           fromCache: true,
         });
         continue;
-      } catch {
+      } catch (e) {
+        if (e instanceof BudgetExceededError) throw e;
         // corrupt cache row: fall through to a live fetch
       }
     }
@@ -572,7 +802,13 @@ export async function fetchEmailsBatch(
       // command, including the FLAGS-only ones a server pushes when another
       // session changes flags. Those carry no structure; keep the real answer.
       if (m.uid == null || !m.bodyStructure || !m.envelope) continue;
-      fetchedMeta.set(m.uid, m);
+      // Bound this message's metadata before reading the next one.
+      const envelope = boundEnvelope(m.envelope as EnvelopeLike);
+      const bodyStructure = boundBodyStructure(m.bodyStructure);
+      chargeMetadata(bodyOpts.metadataBudget, jsonSize(envelope) + jsonSize(bodyStructure));
+      checkAborted(bodyOpts.signal);
+      fetchedMeta.set(m.uid, { uid: m.uid, flags: m.flags, size: m.size, internalDate: m.internalDate,
+        envelope, bodyStructure } as FetchMessageObject);
     }
     // One block at a time: derive the ThreadInputs (or reuse the ones the
     // thread scan already cached for this message), keep the full block only
@@ -596,7 +832,9 @@ export async function fetchEmailsBatch(
     }
     for (const [uid, m] of fetchedMeta) {
       const r = reduced.get(uid);
-      raws.set(uid, rawFromFetch(m, r?.thread ?? EMPTY_THREAD, r?.full ?? null, r?.truncated ?? false));
+      const raw = rawFromFetch(m, r?.thread ?? EMPTY_THREAD, r?.full ?? null, r?.truncated ?? false);
+      raw.cachedThreadId = cachedRows.get(uid)?.thread_id ?? null;
+      raws.set(uid, raw);
     }
   }
 

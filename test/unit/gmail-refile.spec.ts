@@ -42,6 +42,9 @@ function setup(kind: string) {
 function fakeClient(opts: { moveOk: boolean }) {
   const calls: string[] = [];
   const client = {
+    // What imapflow reports for the SELECTed mailbox; ids carry the same
+    // UIDVALIDITY, so they are current.
+    mailbox: { uidValidity: 1n },
     getMailboxLock: async (p: string) => {
       calls.push(`select ${p}`);
       return { release: () => {} };

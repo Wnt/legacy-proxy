@@ -100,6 +100,80 @@ Changes from upstream:
     `src/imap/client.ts`, `src/state/store.ts`.
 
   Tests: `test/unit/security-*.spec.ts` and `test/unit/contacts-set.spec.ts`.
+- **Security fixes from the 2026-10 audit (findings legacy-proxy-4 to -9).**
+  - *Contact patches can't reach a prototype.* `applyPatch` checks every path
+    before writing: `__proto__`, `prototype` and `constructor` components are
+    `invalidPatch`, traversal follows own properties only, and new containers
+    have no prototype. Result references (`#ids` paths) also read own
+    properties only. Code: `src/jmap/methods/contacts.ts`, `src/jmap/refs.ts`.
+  - *Body values are bounded before buffering.* Each text part is a partial
+    `BODY[part]<0.N>`, N the most transfer-encoded bytes (7bit, base64 or
+    quoted-printable) that can decode to the requested `maxBodyValueBytes`.
+    That limit is clamped to 4 MiB (`0`, "unlimited", means 4 MiB too). One
+    HTTP request fetches at most 32 MiB of body values over all its Email/get
+    calls and mailboxes (the header budgets above are per request too); values
+    past that come back empty with `isTruncated`. Everything those calls
+    return is charged too, at its serialized UTF-8 JSON size: 64 MiB of
+    Email objects per request, every property counted, then
+    `requestTooLarge`; results are projected and charged per mailbox group as
+    they arrive. Each message's ENVELOPE (16 KiB subject, up to 1,000
+    addresses per field, 64 KiB in all; an overlong Message-ID or
+    In-Reply-To is dropped, not cut) and BODYSTRUCTURE (16 levels, 256
+    parts, 998-character strings, 128 KiB in all) are bounded as they arrive,
+    before the next message is read, in one traversal that also caps keys and
+    parameters, with a hard bound on the serialized size. Cached rows are
+    read one at a time (the `hasAttachment` filter keeps only its predicate,
+    date-only sorts read only dates), are bounded the same way, and charge a
+    64 MiB per-request metadata allowance. The message cache and scan
+    checkpoints are reset once more on upgrade (`user_version` 2), states
+    moved, so the thread index is rebuilt. Invalid `header:` property names
+    are refused rather than echoed. A
+    message's cached threadId is reused, so Email/get and the thread scan
+    report the same one. A client that disconnects stops its request: it
+    leaves the per-account queue, and Email/get and draft creation stop at
+    their next step. A draft's
+    MIME is built from at most 50 MB (the advertised
+    `maxSizeAttachmentsPerEmail`) of blobs and body values: `mimeContentPlan`
+    counts every occurrence the builder will encode, the way it decides, and
+    blobs are checked from stored sizes before loading or while they stream.
+    The worst-case encoded size (quoted-printable for text; blobs are always
+    encoded base64) must fit 80 MiB before any encoder runs, and the build itself
+    streams and stops at 80 MiB (`tooLarge` either way).
+    Non-multipart parts with `subParts` are refused. One blob read is capped
+    at 64 MiB, and a message is only buffered for submission up to 80 MiB. Code:
+    `src/imap/fetcher.ts`, `src/backends/legacy.ts`, `src/jmap/methods/email.ts`,
+    `src/jmap/blobs.ts`, `src/jmap/methods/submission.ts`.
+  - *Stale ids can't hit another message.* An email or blob id carries the
+    mailbox's UIDVALIDITY. Every read or write by id (Email/get, Email/set
+    update and destroy, Email/copy, blob reads, downloads, submission) now
+    checks it against the selected mailbox under the lock and answers
+    `notFound` on a mismatch, so after a mailbox reset an old id never acts
+    on the message that now has its UID. Code: `src/imap/client.ts`
+    (`selectedUidValidity`), `src/jmap/methods/email.ts`, `src/jmap/blobs.ts`,
+    `src/server.ts`, `src/jmap/methods/submission.ts`.
+  - *Nodemailer 10.0.13 and mailparser 3.9.32* (pinned exactly) replace
+    Nodemailer 6.10.1 and mailparser 3.7.x with its nested Nodemailer 8.0.5;
+    both copies had the quadratic address-parser advisories
+    (GHSA-v53p-9fqp-m79j, GHSA-2x7j-588g-ccc2). The lockfile now resolves a
+    single Nodemailer.
+  - *The pool cap holds under concurrency.* A connection slot is reserved in
+    the same synchronous step as the cap check, before any await, and given
+    back if the open fails. A caller that finds every slot busy registers its
+    wait in that same step (after re-checking for a connection released while
+    it awaited a NOOP), so a release can't slip past it. At most 64 callers
+    wait per account and role; queued callers can't be cancelled.
+    JMAP API requests are limited per account to the advertised
+    `maxConcurrentRequests` (10); up to 40 more wait, and beyond that the
+    request gets the RFC 8620 `limit` error, which clients back off from.
+    Code: `src/imap/pool.ts`, `src/util/limiter.ts`, `src/server.ts`.
+  - *Session tokens are schema-checked.* A signed payload must have non-empty
+    string `accountSlug` and `username`, integer `iat` and `exp`, `exp` in the
+    future, `iat` not in the future, and a lifetime of at most 7 days. The
+    token's username must match the account it names.
+    Code: `src/auth/session.ts`, `src/server.ts`.
+
+  Tests: `test/unit/security-*.spec.ts`, `test/unit/contacts-set.spec.ts`,
+  `test/unit/pool.spec.ts` and `test/unit/session.spec.ts`.
 
 > Pre-1.0. The wire shapes, storage formats, and config keys can change without
 > notice. There is no third-party security audit. Run it for development,

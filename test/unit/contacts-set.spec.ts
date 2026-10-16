@@ -248,6 +248,38 @@ describe("security: contact resource boundaries", () => {
     return seen;
   }
 
+  it("rejects patch paths that mutate the process-wide object prototype", async () => {
+    const book = dav.addBook("personal", "Personal", [["alice.vcf", ALICE]]);
+    const id = Buffer.from(`${book}\n${book}alice.vcf`).toString("base64url");
+    const proto = Object.prototype as Record<string, unknown>;
+    try {
+      const result = await contactCardSet({ accountId: "7", update: {
+        [id]: { "__proto__/auditContactMarker": "untrusted contact patch" },
+      } }, ctx);
+      expect(Object.hasOwn(proto, "auditContactMarker")).toBe(false);
+      expect(result.notUpdated?.[id]?.type).toBe("invalidPatch");
+    } finally {
+      delete proto.auditContactMarker;
+    }
+  });
+
+  it.each([
+    "__proto__/x", "constructor/prototype/x", "name/__proto__/x", "emails/e1/constructor",
+    "prototype", "emails~1x/__proto__",
+  ])("rejects %s without touching the card or any prototype", async (path) => {
+    const book = dav.addBook("personal", "Personal", [["alice.vcf", ALICE]]);
+    const id = Buffer.from(`${book}\n${book}alice.vcf`).toString("base64url");
+    const before = dav.books.get(book)!.resources.get(`${book}alice.vcf`)!.data;
+    const result = await contactCardSet({ accountId: "7", update: {
+      [id]: { "name/full": "Changed", [path]: "polluted" },
+    } }, ctx);
+    expect(result.notUpdated?.[id]?.type).toBe("invalidPatch");
+    expect(dav.books.get(book)!.resources.get(`${book}alice.vcf`)!.data).toBe(before);
+    expect(({} as Record<string, unknown>).x).toBeUndefined();
+    expect(Object.hasOwn(Object.prototype, "x")).toBe(false);
+    expect(Object.hasOwn(Function.prototype, "x")).toBe(false);
+  });
+
   it("does not send the mailbox password to a URL encoded in a contact id", async () => {
     const book = dav.addBook("personal", "Personal");
     const foreign = "https://collector.example.test/contact.vcf";
@@ -662,6 +694,13 @@ describe("AddressBook/set", () => {
 // -- patch helper ---------------------------------------------------------------
 
 describe("applyPatch", () => {
+  it("does not follow inherited properties", () => {
+    const o: Record<string, unknown> = {};
+    applyPatch(o, { "toString/x": 1 });
+    expect(Object.hasOwn(o, "toString")).toBe(true);
+    expect((Object.prototype.toString as unknown as Record<string, unknown>).x).toBeUndefined();
+  });
+
   it("sets nested paths, replaces top-level keys, and deletes on null", () => {
     const o: Record<string, unknown> = { emails: { e1: { address: "a@x" }, e2: { address: "b@x" } }, name: { full: "A" } };
     applyPatch(o, { "emails/e1/address": "z@x", "emails/e2": null, name: { full: "B" }, "notes/n1": { note: "hi" } });

@@ -10,12 +10,13 @@ import { ImapPool } from "./imap/pool.js";
 import { resolveProvider, resolveProviderName } from "./auth/providers.js";
 import { sealCredentials, openCredentials, type Credentials } from "./auth/credentials.js";
 import { makeSession, signSession, verifySession } from "./auth/session.js";
+import { KeyedLimiter, LimitError } from "./util/limiter.js";
 import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
 import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
-import { imapErrorDetails, openImap } from "./imap/client.js";
+import { imapErrorDetails, openImap, selectedUidValidity } from "./imap/client.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 
@@ -145,6 +146,14 @@ app.get("/jmap/session", async (req, reply) => {
   return buildSession(cfg, account, provider);
 });
 
+// The advertised maxConcurrentRequests, enforced per account. Requests over it
+// wait (a browser fans out a few at once on a push); only a backlog beyond
+// that is refused.
+const requestLimiter = new KeyedLimiter(
+  cfg.limits.maxConcurrentRequests,
+  cfg.limits.maxConcurrentRequests * 4,
+);
+
 app.post("/jmap", async (req, reply) => {
   const account = await authn(req);
   if (!account) return send401(reply);
@@ -161,12 +170,23 @@ app.post("/jmap", async (req, reply) => {
       });
     }
   }
+  // A client that disconnects stops its request's remaining work (and its
+  // place in the queue) instead of letting it run to a response nobody reads.
+  const abort = new AbortController();
+  reply.raw.on("close", () => {
+    if (!reply.raw.writableFinished) abort.abort();
+  });
   try {
-    const out = await dispatch(env, {
-      methods: makeLegacyMethods({ cfg, pool, store, account, dispatcher }),
-      maxCallsInRequest: cfg.limits.maxCallsInRequest,
-      sessionState: `s${account.id}`,
-    });
+    const out = await requestLimiter.run(
+      String(account.id),
+      () =>
+        dispatch(env, {
+          methods: makeLegacyMethods({ cfg, pool, store, account, dispatcher, signal: abort.signal }),
+          maxCallsInRequest: cfg.limits.maxCallsInRequest,
+          sessionState: `s${account.id}`,
+        }),
+      abort.signal,
+    );
     if (process.env.JMAP_DEBUG === "1") {
       log.info(
         { calls: env.methodCalls.map((c) => c[0]), responses: out.methodResponses },
@@ -175,6 +195,15 @@ app.post("/jmap", async (req, reply) => {
     }
     return out;
   } catch (e) {
+    if (e instanceof LimitError) {
+      // RFC 8620 §3.6.1; clients back off and retry.
+      return reply.code(400).send({
+        type: "urn:ietf:params:jmap:error:limit",
+        status: 400,
+        limit: "maxConcurrentRequests",
+        detail: "too many concurrent requests for this account",
+      });
+    }
     log.error({ err: (e as Error).message }, "jmap dispatch error");
     return reply.code(500).send({ error: "internal" });
   }
@@ -230,6 +259,7 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     } catch {
       return reply.code(404).send({ error: "blob not found" });
     }
+    if (emailParts.accountIdx !== account.id) return reply.code(404).send({ error: "blob not found" });
     const mbox = store
       .prep(`SELECT id,name FROM mailbox WHERE id = ? AND account_id = ?`)
       .get(emailParts.mailboxIdx, account.id) as { id: number; name: string } | undefined;
@@ -270,6 +300,12 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     };
 
     try {
+      // A blob id from another UIDVALIDITY epoch names a message that is gone;
+      // the same UID may now be a different one.
+      if (selectedUidValidity(client) !== emailParts.uidvalidity) {
+        release();
+        return reply.code(404).send({ error: "blob not found" });
+      }
       const dl = await client.download(
         `${emailParts.uid}`,
         parsed.partId ?? undefined,
@@ -442,7 +478,10 @@ async function authn(req: {
     const token = h.slice("Bearer ".length).trim();
     const sess = verifySession(cfg.sessionHmacKey, token);
     if (!sess) return null;
-    return store.getAccount(sess.accountSlug) ?? null;
+    const account = store.getAccount(sess.accountSlug);
+    // The token names the account twice; both must agree.
+    if (!account || account.username.toLowerCase() !== sess.username.toLowerCase()) return null;
+    return account;
   }
 
   if (h.startsWith("Basic ")) {

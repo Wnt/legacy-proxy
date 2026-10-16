@@ -47,7 +47,8 @@ vi.mock("../../src/auth/providers.js", () => ({
   resolveProvider: vi.fn(() => ({ imap: { host: "imap.test", port: 993 } })),
 }));
 
-const { ImapPool, viewEmailState } = await import("../../src/imap/pool.js");
+const { ImapPool, PoolBusyError, viewEmailState } = await import("../../src/imap/pool.js");
+const { openImap } = await import("../../src/imap/client.js");
 import type { AccountRow, Store } from "../../src/state/store.js";
 import type { AppConfig } from "../../src/util/config.js";
 
@@ -73,6 +74,46 @@ beforeEach(() => {
 });
 
 describe("ImapPool", () => {
+  it("security: reserves connection slots before concurrent opens await", async () => {
+    const pool = makePool();
+    try {
+      await Promise.all(Array.from({ length: 12 }, () =>
+        pool.withConnection(account, "interactive", async () => { await settle(); }),
+      ));
+      expect(opened.length).toBeLessThanOrEqual(3);
+    } finally {
+      await pool.closeAll();
+    }
+  });
+
+  it("security: a failed open gives its slot back and wakes a waiter", async () => {
+    const pool = makePool();
+    try {
+      vi.mocked(openImap).mockRejectedValueOnce(new Error("login failed"));
+      const results = await Promise.allSettled(Array.from({ length: 5 }, () =>
+        pool.withConnection(account, "interactive", async () => { await settle(); }),
+      ));
+      expect(results.filter((r) => r.status === "rejected")).toHaveLength(1);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(4);
+      expect(opened.length).toBeLessThanOrEqual(3);
+    } finally {
+      await pool.closeAll();
+    }
+  });
+
+  it("security: refuses callers beyond the waiter bound instead of queueing them", async () => {
+    const pool = makePool();
+    const held = await Promise.all([1, 2, 3].map(() => pool.acquire(account, "interactive")));
+    const parked = Array.from({ length: 64 }, () => pool.acquire(account, "interactive"));
+    await settle();
+    await expect(pool.acquire(account, "interactive")).rejects.toBeInstanceOf(PoolBusyError);
+    const drained = Promise.all(parked.map((p) => p.then((l) => l.release())));
+    for (const l of held) l.release();
+    await drained;
+    expect(opened.length).toBe(3);
+    await pool.closeAll();
+  });
+
   it("gives concurrent callers distinct connections", async () => {
     const pool = makePool();
     const a = await pool.acquire(account, "interactive");
@@ -241,5 +282,41 @@ describe("ImapPool", () => {
     // Nothing moved since: no NOOP on a recently used connection.
     (await pool.acquire(account, "interactive")).release();
     expect(fake.noopCalls).toBe(2);
+  });
+});
+
+describe("ImapPool wakeups", () => {
+  it("security: a release between the cap check and parking is not lost", async () => {
+    const pool = makePool();
+    const held = await Promise.all([1, 2, 3].map(() => pool.acquire(account, "interactive")));
+    const fourth = pool.acquire(account, "interactive");
+    // Release everything before the pending acquisition gets to run again.
+    for (const l of held) l.release();
+    const got = await Promise.race([fourth, new Promise((r) => setTimeout(() => r("stuck"), 200))]);
+    expect(got).not.toBe("stuck");
+    (got as { release: () => void }).release();
+    await pool.closeAll();
+  });
+
+  it("security: a release while another caller NOOPs is not lost", async () => {
+    const pool = makePool();
+    const held = await Promise.all([1, 2, 3].map(() => pool.acquire(account, "interactive")));
+    held[0]!.release();
+    bump("email"); // forces a NOOP on the next take of the idle connection
+    const slow = opened[0]!;
+    let finishNoop!: () => void;
+    slow.noop = () => new Promise<void>((r) => (finishNoop = r));
+    const a = pool.acquire(account, "interactive"); // takes [0], awaits its NOOP
+    const b = pool.acquire(account, "interactive"); // at the cap: parks
+    await settle();
+    held[1]!.release(); // wakes b
+    finishNoop();
+    const la = await a;
+    const lb = await Promise.race([b, new Promise((r) => setTimeout(() => r("stuck"), 200))]);
+    expect(lb).not.toBe("stuck");
+    la.release();
+    (lb as { release: () => void }).release();
+    held[2]!.release();
+    await pool.closeAll();
   });
 });

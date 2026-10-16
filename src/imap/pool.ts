@@ -74,6 +74,18 @@ const MAX_PER_ROLE: Record<PoolRole, number> = {
   bulk: 2,
 };
 
+// Callers that may wait for a connection per pool key. JMAP requests are also
+// limited per account (maxConcurrentRequests) before they get here; this bounds
+// everything else (downloads, IDLE lookups) as well.
+const MAX_WAITERS = 64;
+
+/** Thrown when too many callers are already waiting for a connection. */
+export class PoolBusyError extends Error {
+  constructor(key: string) {
+    super(`too many requests waiting for an IMAP connection (${key})`);
+  }
+}
+
 /** A borrowed connection. `release` must be called exactly once. */
 export interface Lease {
   client: ImapFlow;
@@ -84,6 +96,11 @@ export class ImapPool {
   private entries = new Map<string, PoolEntry[]>();
   // Callers parked waiting for a connection to come free, per pool key.
   private waiters = new Map<string, Array<() => void>>();
+  // Slots reserved by opens still in flight (credential decrypt, TCP, TLS,
+  // LOGIN), per pool key. Counted with the established entries against the
+  // cap, so concurrent callers can't all pass the check before any of them
+  // has attached its connection.
+  private opening = new Map<string, number>();
 
   constructor(
     private cfg: AppConfig,
@@ -115,23 +132,26 @@ export class ImapPool {
   async acquire(account: AccountRow, role: PoolRole = "interactive"): Promise<Lease> {
     const key = `${account.id}:${role}`;
     for (;;) {
-      const entry = await this.takeFree(account, key, role);
-      if (entry) return this.leaseFor(key, entry);
+      const got = await this.takeFree(account, key, role);
+      if ("entry" in got) return this.leaseFor(key, got.entry);
       // At the cap with everything busy: park until someone releases, then
       // re-run the whole selection (the freed entry may have died meanwhile).
-      await this.waitForRelease(key);
+      // takeFree registered the wait in the same synchronous step as the cap
+      // check, so a release in between can't be missed.
+      await got.wait;
     }
   }
 
   /**
    * Claim a usable idle connection, or open one if the role is under its cap.
-   * Returns null when every slot is taken.
+   * When every slot is taken, returns a wait already registered for the next
+   * release.
    */
   private async takeFree(
     account: AccountRow,
     key: string,
     role: PoolRole,
-  ): Promise<PoolEntry | null> {
+  ): Promise<{ entry: PoolEntry } | { wait: Promise<void> }> {
     const list = [...(this.entries.get(key) ?? [])];
     for (const entry of list) {
       if (entry.busy) continue;
@@ -153,11 +173,11 @@ export class ImapPool {
       // committed on the server before we ask, so the NOOP is sure to see it.
       const target = mailState(this.store, account.id);
       const stale = target.email !== entry.synced.email || target.mailbox !== entry.synced.mailbox;
-      if (idleMs < NOOP_FRESHNESS_MS && !stale) return entry;
+      if (idleMs < NOOP_FRESHNESS_MS && !stale) return { entry };
       try {
         await entry.client.noop();
         this.markSynced(entry, target);
-        return entry;
+        return { entry };
       } catch {
         // Dead despite looking usable; drop it and keep looking.
         entry.busy = false;
@@ -165,16 +185,43 @@ export class ImapPool {
       }
     }
 
-    if ((this.entries.get(key)?.length ?? 0) >= MAX_PER_ROLE[role]) return null;
-
-    const provider = resolveProvider(this.cfg, account.kind);
-    const creds: Credentials = await openCredentials(this.cfg.vaultKey, account.vault);
-    const synced = mailState(this.store, account.id);
-    const client = await openImap({ provider, creds });
-    const entry: PoolEntry = { client, lastUsed: Date.now(), busy: true, synced };
-    this.markSynced(entry, synced);
+    // Check and reserve in the same synchronous step, before any await.
+    if (this.slotsInUse(key) >= MAX_PER_ROLE[role]) {
+      // A connection released while we awaited a NOOP above woke nobody (we
+      // weren't queued yet): take another pass instead of parking.
+      const freed = (this.entries.get(key) ?? []).some((e) => !e.busy && e.client.usable);
+      return { wait: freed ? Promise.resolve() : this.waitForRelease(key) };
+    }
+    this.opening.set(key, (this.opening.get(key) ?? 0) + 1);
+    let entry: PoolEntry;
+    try {
+      const provider = resolveProvider(this.cfg, account.kind);
+      const creds: Credentials = await openCredentials(this.cfg.vaultKey, account.vault);
+      const synced = mailState(this.store, account.id);
+      const client = await openImap({ provider, creds });
+      entry = { client, lastUsed: Date.now(), busy: true, synced };
+      this.markSynced(entry, synced);
+    } catch (e) {
+      this.unreserve(key);
+      // The slot is free again: let a parked caller try to open it.
+      this.wake(key);
+      throw e;
+    }
+    // Hand the reservation over to the attached entry in one step.
+    this.unreserve(key);
     this.attach(account, key, entry);
-    return entry;
+    return { entry };
+  }
+
+  /** Established plus still-opening connections for a pool key. */
+  private slotsInUse(key: string): number {
+    return (this.entries.get(key)?.length ?? 0) + (this.opening.get(key) ?? 0);
+  }
+
+  private unreserve(key: string): void {
+    const n = (this.opening.get(key) ?? 1) - 1;
+    if (n > 0) this.opening.set(key, n);
+    else this.opening.delete(key);
   }
 
   private markSynced(entry: PoolEntry, state: MailState): void {
@@ -200,8 +247,11 @@ export class ImapPool {
   }
 
   private waitForRelease(key: string): Promise<void> {
+    const queue = this.waiters.get(key) ?? [];
+    // Each parked caller is a request holding memory; past this many, fail
+    // fast instead of queueing without bound.
+    if (queue.length >= MAX_WAITERS) throw new PoolBusyError(key);
     return new Promise<void>((resolve) => {
-      const queue = this.waiters.get(key) ?? [];
       queue.push(resolve);
       this.waiters.set(key, queue);
     });
@@ -222,7 +272,7 @@ export class ImapPool {
   // logged out.
   adopt(account: AccountRow, client: ImapFlow): void {
     const key = `${account.id}:interactive`;
-    if ((this.entries.get(key)?.length ?? 0) >= MAX_PER_ROLE.interactive) {
+    if (this.slotsInUse(key) >= MAX_PER_ROLE.interactive) {
       client.logout().catch(() => {});
       return;
     }

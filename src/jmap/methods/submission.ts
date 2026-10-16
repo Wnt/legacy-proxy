@@ -3,7 +3,7 @@ import { simpleParser } from "mailparser";
 import type { AccountRow, Store } from "../../state/store.js";
 import type { AppConfig } from "../../util/config.js";
 import { decodeEmailId } from "../../mapping/ids.js";
-import { withMailbox } from "../../imap/client.js";
+import { selectedUidValidity, withMailbox } from "../../imap/client.js";
 import { resolveProvider } from "../../auth/providers.js";
 import { openCredentials } from "../../auth/credentials.js";
 import { submit } from "../../smtp/submit.js";
@@ -88,7 +88,11 @@ export interface EmailSubmissionSetResponse {
   notDestroyed: Record<string, SetError> | null;
 }
 
-async function fetchRfc822(
+// Larger than any message this proxy can build (50 MB of attachments, encoded)
+// and above common submission limits.
+const MAX_SUBMIT_BYTES = 80 * 1024 * 1024;
+
+export async function fetchRfc822(
   client: ImapFlow,
   emailId: string,
   store: Store,
@@ -107,6 +111,15 @@ async function fetchRfc822(
   if (!mbox) throw notFound();
 
   const raw = await withMailbox(client, mbox.name, async () => {
+    // A stale id (other UIDVALIDITY epoch) must not send whatever message
+    // now has its UID.
+    if (selectedUidValidity(client) !== parts.uidvalidity) return null;
+    // The whole message is held in memory to send it: check the size first.
+    const meta = await client.fetchOne(`${parts.uid}`, { uid: true, size: true }, { uid: true });
+    if (!meta) return null;
+    if ((meta.size ?? 0) > MAX_SUBMIT_BYTES) {
+      throw new JmapError("tooLarge", `message is larger than ${MAX_SUBMIT_BYTES} bytes`);
+    }
     const msg = await client.fetchOne(`${parts.uid}`, { uid: true, source: true }, { uid: true });
     if (!msg || !msg.source) return null;
     return msg.source;

@@ -145,6 +145,9 @@ function walk(here: Json, parts: string[], i: number): Json {
     return walk(here[Number(seg)], parts, i + 1);
   }
   if (here && typeof here === "object") {
+    // Own properties only: "/constructor" or "/__proto__" must not reach the
+    // prototype chain.
+    if (!Object.hasOwn(here, seg)) return undefined;
     return walk((here as Record<string, Json>)[seg], parts, i + 1);
   }
   return undefined;

@@ -1,3 +1,4 @@
+import { newRequestBudgets, type RequestBudgets } from "../imap/fetcher.js";
 import type { ImapPool } from "../imap/pool.js";
 import type { Store, AccountRow } from "../state/store.js";
 import type { AppConfig } from "../util/config.js";
@@ -52,6 +53,10 @@ export interface LegacyContext {
   store: Store;
   account: AccountRow;
   dispatcher: PushDispatcher;
+  /** Per HTTP request: set by makeLegacyMethods. */
+  budgets?: RequestBudgets;
+  /** Aborted when the HTTP client goes away. */
+  signal?: AbortSignal;
 }
 
 type Handler = (args: Record<string, unknown>, ctx: LegacyContext) => Promise<unknown>;
@@ -178,11 +183,12 @@ function makeMethodTable(): Record<string, Handler> {
         emailGet(a as never, {
           account: c.account, client, store: c.store, pool: c.pool,
           maxObjectsInGet: c.cfg.limits.maxObjectsInGet,
+          budgets: c.budgets,
         }),
       ),
     "Email/set": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
-        emailSet(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
+        emailSet(a as never, { account: c.account, client, store: c.store, pool: c.pool, budgets: c.budgets }),
       ),
     "Email/changes": async (a, c) =>
       emailChanges(a as never, { account: c.account, store: c.store }),
@@ -253,8 +259,13 @@ function makeMethodTable(): Record<string, Handler> {
 const TABLE = makeMethodTable();
 
 /** Bind the legacy transports to the authenticated account for one request. */
+// Called once per HTTP request, so the request's method calls share one set
+// of Email/get budgets.
 export function makeLegacyMethods(ctx: LegacyContext): MethodTable {
+  const budgets = ctx.budgets ?? newRequestBudgets();
+  if (ctx.signal) budgets.signal = ctx.signal;
+  const withBudgets = { ...ctx, budgets };
   return Object.fromEntries(
-    Object.entries(TABLE).map(([name, handler]) => [name, (args: Record<string, unknown>) => handler(args, ctx)]),
+    Object.entries(TABLE).map(([name, handler]) => [name, (args: Record<string, unknown>) => handler(args, withBudgets)]),
   );
 }

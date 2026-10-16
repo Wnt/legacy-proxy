@@ -200,6 +200,23 @@ export class Store {
     this.migrate();
   }
 
+  // Drop every cached message and scan checkpoint, and move every state:
+  // recorded ones, and each account's email and mailbox state past the
+  // implicit 0, so no client's saved state still matches (Email/changes and
+  // Thread/changes use "email").
+  private resetMessageCache(): void {
+    this.db.exec(`DELETE FROM email_cache; DELETE FROM mailbox_scan;`);
+    const now = Date.now();
+    this.db.prepare(`UPDATE state_log SET state = state + 1, at = ?`).run(now);
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO state_log(account_id, kind, state, at)
+         SELECT a.id, k.kind, 1, ? FROM account a
+         CROSS JOIN (SELECT 'email' AS kind UNION ALL SELECT 'mailbox') k`,
+      )
+      .run(now);
+  }
+
   // One-time upgrades, tracked in PRAGMA user_version.
   private migrate(): void {
     const version = this.db.pragma("user_version", { simple: true }) as number;
@@ -218,20 +235,19 @@ export class Store {
         if (!cols.some((c) => c.name === "headers_truncated")) {
           this.db.exec(`ALTER TABLE email_cache ADD COLUMN headers_truncated INTEGER NOT NULL DEFAULT 0`);
         }
-        this.db.exec(`DELETE FROM email_cache; DELETE FROM mailbox_scan;`);
-        // Move every recorded state, and give every account an email and a
-        // mailbox state past the implicit 0, so no client's saved state
-        // still matches (Email/changes and Thread/changes use "email").
-        const now = Date.now();
-        this.db.prepare(`UPDATE state_log SET state = state + 1, at = ?`).run(now);
-        this.db
-          .prepare(
-            `INSERT OR IGNORE INTO state_log(account_id, kind, state, at)
-             SELECT a.id, k.kind, 1, ? FROM account a
-             CROSS JOIN (SELECT 'email' AS kind UNION ALL SELECT 'mailbox') k`,
-          )
-          .run(now);
+        this.resetMessageCache();
         this.db.pragma("user_version = 1");
+      })();
+    }
+    if (this.db.pragma("user_version", { simple: true }) as number < 2) {
+      // v2: ENVELOPE / BODYSTRUCTURE are bounded when fetched, and threading
+      // never derives from a clipped Message-ID. Rows cached by v1 may hold
+      // neither guarantee, and they are also the thread index: reset the
+      // message cache and scan checkpoints together, and move every state, as
+      // v1 did, so the index is rebuilt and clients resync.
+      this.db.transaction(() => {
+        this.resetMessageCache();
+        this.db.pragma("user_version = 2");
       })();
     }
   }
@@ -456,6 +472,18 @@ export class Store {
       .run(p.id, p.accountId, p.ctype, p.body.length, p.body, Date.now());
   }
 
+  getUploadSize(id: string, accountId: number): number | null {
+    const row = this.prep(`SELECT size FROM upload WHERE id = ? AND account_id = ?`)
+      .get(id, accountId) as { size: number } | undefined;
+    return row?.size ?? null;
+  }
+
+  getCachedBlobSize(id: string, accountId: number): number | null {
+    const row = this.prep(`SELECT length(body) AS size FROM blob_cache WHERE id = ? AND account_id = ? AND expires > ?`)
+      .get(id, accountId, Date.now()) as { size: number } | undefined;
+    return row?.size ?? null;
+  }
+
   getUpload(id: string, accountId: number): { ctype: string; body: Buffer } | null {
     const row = this.prep(`SELECT ctype, body FROM upload WHERE id = ? AND account_id = ?`)
       .get(id, accountId) as { ctype: string; body: Buffer } | undefined;
@@ -618,13 +646,14 @@ export class Store {
     const out = new Map<number, EmailCacheRow>();
     for (let i = 0; i < uids.length; i += Store.IN_CHUNK) {
       const chunk = uids.slice(i, i + Store.IN_CHUNK);
-      // Every column but the header block, which can be large: callers
-      // that want it read it per message within their budget
-      // (getEmailCacheHeaders).
+      // Scalar columns and sizes only: the header block, envelope and
+      // bodystructure can be large, so callers read them per message within
+      // their budgets (getEmailCacheHeaders, getEmailCacheMeta).
       const rows = this.prep(
           `SELECT account_id, mailbox_id, uidvalidity, uid, thread_id, internaldate, size,
-                  envelope, bodystructure, headers_full, headers_truncated, preview,
-                  created_at, thread_inputs, length(headers_raw) AS headers_len
+                  NULL AS envelope, NULL AS bodystructure, headers_full, headers_truncated, preview,
+                  created_at, thread_inputs, length(headers_raw) AS headers_len,
+                  length(envelope) AS envelope_len, length(bodystructure) AS bodystructure_len
            FROM email_cache
            WHERE account_id = ? AND mailbox_id = ? AND uidvalidity = ?
            AND uid IN (${chunk.map(() => "?").join(",")})`,
@@ -633,6 +662,16 @@ export class Store {
       for (const r of rows) out.set(r.uid, r);
     }
     return out;
+  }
+
+  /** One message's cached ENVELOPE and BODYSTRUCTURE JSON. */
+  getEmailCacheMeta(accountId: number, mailboxId: number, uidvalidity: number, uid: number):
+    { envelope: string | null; bodystructure: string | null } | null {
+    return (this.prep(
+        `SELECT envelope, bodystructure FROM email_cache
+         WHERE account_id = ? AND mailbox_id = ? AND uidvalidity = ? AND uid = ?`,
+      )
+      .get(accountId, mailboxId, uidvalidity, uid) as { envelope: string | null; bodystructure: string | null } | undefined) ?? null;
   }
 
   /** The cached header block of one message, as stored by Email/get. */
@@ -792,6 +831,8 @@ export interface EmailCacheRow {
   headers_raw?: Buffer | null;
   /** Byte length of the cached header block, or null when none is cached. */
   headers_len?: number | null;
+  envelope_len?: number | null;
+  bodystructure_len?: number | null;
   headers_full: number;
   headers_truncated?: number;
   preview: string | null;

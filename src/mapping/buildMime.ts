@@ -130,6 +130,10 @@ function nodeFromBodyStructure(
     // An empty part would go out as a blank file or a broken inline image;
     // refuse the message instead.
     if (!blob) throw new MissingBlobError(part.blobId);
+    // Always base64: it is the encoding the caller's size preflight assumes,
+    // and nodemailer would otherwise pick quoted-printable for a text/* blob,
+    // which can triple it.
+    node.setHeader("Content-Transfer-Encoding", "base64");
     setContent(node, blob.body);
   }
   return node;
@@ -181,6 +185,52 @@ function wrapAttachments(
   return root;
 }
 
+/**
+ * What buildRfc822 will put into the message, counted the way it builds it:
+ * how many times each blob is encoded, and the bytes of body text. It walks
+ * the same decisions as nodeFromBodyStructure / resolveBody / wrapAttachments
+ * (a multipart type recurses, a leaf takes its body value if it has one and
+ * else its blob; attachments are built without body values), so callers can
+ * bound a draft before loading anything. Keep the two in step.
+ */
+export function mimeContentPlan(create: JmapEmailCreate): { blobs: Map<string, number>; textBytes: number } {
+  const blobs = new Map<string, number>();
+  let textBytes = 0;
+  const walk = (part: BodyStructurePart, values: Record<string, BodyValue> | null): void => {
+    const type = part.type ?? "text/plain";
+    if (type.toLowerCase().startsWith("multipart/")) {
+      for (const child of part.subParts ?? []) walk(child, values);
+      return;
+    }
+    const v = part.partId ? values?.[part.partId]?.value : undefined;
+    if (v !== undefined) textBytes += typeof v === "string" ? Buffer.byteLength(v) : 0;
+    else if (part.blobId) blobs.set(part.blobId, (blobs.get(part.blobId) ?? 0) + 1);
+  };
+  if (create.bodyStructure) {
+    walk(create.bodyStructure, create.bodyValues ?? null);
+  } else {
+    for (const refs of [create.textBody, create.htmlBody]) {
+      for (const r of refs ?? []) {
+        const v = r.partId ? create.bodyValues?.[r.partId]?.value : undefined;
+        if (typeof v === "string") textBytes += Buffer.byteLength(v) + 2;
+      }
+    }
+    for (const a of create.attachments ?? []) walk(a, null);
+  }
+  return { blobs, textBytes };
+}
+
+// The most a built message may take: 50 MB of content, base64-encoded, plus
+// headers and structure. Same as the submission limit.
+export const MAX_MIME_BYTES = 80 * 1024 * 1024;
+
+/** buildRfc822 stopped: the encoded message passed its byte limit. */
+export class MessageTooLargeError extends Error {
+  constructor(readonly limit: number) {
+    super(`the message is larger than ${limit} bytes`);
+  }
+}
+
 export interface BlobLookup {
   // Returns the bytes for a blobId, or null if missing. The lookup is
   // synchronous for buildRfc822's MimeNode walk; callers load the referenced
@@ -193,6 +243,7 @@ export async function buildRfc822(
   hostname: string,
   getBlob: BlobLookup = () => null,
   keepBcc = false,
+  maxBytes: number = MAX_MIME_BYTES,
 ): Promise<Buffer> {
   // Callers validate first to answer with invalidProperties; this is the
   // backstop for any caller that didn't.
@@ -277,10 +328,19 @@ export async function buildRfc822(
   // sent to. Submission strips it again before handing the message to SMTP.
   root.keepBcc = true;
 
-  return await new Promise<Buffer>((resolve, reject) => {
-    root.build((err: Error | null, message: Buffer) => {
-      if (err) reject(err);
-      else resolve(message);
-    });
-  });
+  // Stream the build so an oversized message stops as soon as it passes the
+  // limit, instead of being completed in memory and measured afterwards.
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const stream = root.createReadStream();
+  try {
+    for await (const chunk of stream) {
+      total += (chunk as Buffer).length;
+      if (total > maxBytes) throw new MessageTooLargeError(maxBytes);
+      chunks.push(chunk as Buffer);
+    }
+  } finally {
+    stream.destroy();
+  }
+  return Buffer.concat(chunks);
 }

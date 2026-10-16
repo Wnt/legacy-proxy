@@ -3,8 +3,19 @@ import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
 import { viewEmailState, type ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
-import { fetchEmailsBatch, MAX_FULL_HEADER_BYTES_PER_CALL, type JmapEmail } from "../../imap/fetcher.js";
-import { withMailbox } from "../../imap/client.js";
+import {
+  fetchEmailsBatch,
+  MAX_FULL_HEADER_BYTES_PER_CALL,
+  MAX_RESPONSE_CHARS,
+  MAX_BODYSTRUCTURE_JSON_CHARS,
+  boundBodyStructure,
+  BudgetExceededError,
+  checkAborted,
+  newRequestBudgets,
+  type JmapEmail,
+  type RequestBudgets,
+} from "../../imap/fetcher.js";
+import { selectedUidValidity, withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
 import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
@@ -14,9 +25,17 @@ import { mapWithConcurrency } from "../../util/concurrency.js";
 import { headersToEmailHeaders, projectHeaderProp } from "../../imap/headers.js";
 import { buildThreadIndex } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
-import { buildRfc822, MissingBlobError, type BodyStructurePart, type JmapEmailCreate } from "../../mapping/buildMime.js";
+import {
+  buildRfc822,
+  MAX_MIME_BYTES,
+  MessageTooLargeError,
+  mimeContentPlan,
+  MissingBlobError,
+  type BodyStructurePart,
+  type JmapEmailCreate,
+} from "../../mapping/buildMime.js";
 import { InvalidEmailCreateError, validateEmailCreate } from "../../mapping/emailCreate.js";
-import { readBlob } from "../blobs.js";
+import { BlobTooLargeError, readBlob } from "../blobs.js";
 import {
   changesFromLog,
   changesOrCannotCalculate,
@@ -35,6 +54,8 @@ interface MailCtx {
   pool?: ImapPool;
   /** The session's advertised maxObjectsInGet (config limits). */
   maxObjectsInGet?: number;
+  /** Shared by every Email/get of one HTTP request; fresh per call if absent. */
+  budgets?: RequestBudgets;
 }
 
 // Same default as the config's MAX_OBJECTS_IN_GET.
@@ -417,17 +438,20 @@ async function postFilterByHasAttachment(
   want: boolean,
 ): Promise<string[]> {
   if (ids.length === 0) return ids;
-  const groups = new Map<number, string[]>();
+  // One group per mailbox and UIDVALIDITY epoch, so cache rows are read and
+  // written under the epoch the ids name.
+  const groups = new Map<string, { mailboxIdx: number; gids: string[] }>();
   for (const id of ids) {
     let parts;
     try { parts = decodeEmailId(id); } catch { continue; }
     if (parts.accountIdx !== ctx.account.id) continue;
-    const arr = groups.get(parts.mailboxIdx) ?? [];
-    arr.push(id);
-    groups.set(parts.mailboxIdx, arr);
+    const key = `${parts.mailboxIdx}:${parts.uidvalidity}`;
+    const g = groups.get(key) ?? { mailboxIdx: parts.mailboxIdx, gids: [] };
+    g.gids.push(id);
+    groups.set(key, g);
   }
   const keep = new Set<string>();
-  for (const [mailboxIdx, gids] of groups) {
+  for (const { mailboxIdx, gids } of groups.values()) {
     const row = ctx.store
       .prep(`SELECT id, name FROM mailbox WHERE id = ? AND account_id = ?`)
       .get(mailboxIdx, ctx.account.id) as { id: number; name: string } | undefined;
@@ -451,11 +475,15 @@ async function postFilterByHasAttachment(
     const missingUids: number[] = [];
     for (const [uid, eid] of uidByEid) {
       const cached = cachedRows.get(uid);
-      if (cached?.bodystructure != null && cached.bodystructure !== "null") {
+      const len = cached?.bodystructure_len ?? 0;
+      if (len > 0 && len <= MAX_BODYSTRUCTURE_JSON_CHARS) {
+        // One row at a time, keeping only the predicate.
         try {
-          const has = bodyStructureHasAttachment(JSON.parse(cached.bodystructure));
-          if (has === want) keep.add(eid);
-          continue;
+          const bs = ctx.store.getEmailCacheMeta(ctx.account.id, mailboxIdx, uidvalidity, uid)?.bodystructure;
+          if (bs && bs !== "null") {
+            if (bodyStructureHasAttachment(boundBodyStructure(JSON.parse(bs))) === want) keep.add(eid);
+            continue;
+          }
         } catch { /* corrupt row: refetch */ }
       }
       missingUids.push(uid);
@@ -463,21 +491,28 @@ async function postFilterByHasAttachment(
     if (missingUids.length === 0) continue;
     try {
       await withMailbox(ctx.client, row.name, async () => {
-        const upserts: EmailCacheUpsert[] = [];
+        if (!isCurrentEpoch(ctx.client, uidvalidity)) return; // stale ids: filtered out
+        // Bounded like Email/get's, judged as each arrives, and written in
+        // batches: the filter keeps only the predicate per message.
+        let upserts: EmailCacheUpsert[] = [];
         for await (const msg of fetchByUid(ctx.client, missingUids, { uid: true, bodyStructure: true })) {
           const uid = Number(msg.uid);
           const eid = uidByEid.get(uid);
           // A FLAGS-only FETCH pushed mid-command has no structure to judge by.
           if (!eid || !msg.bodyStructure) continue;
-          const has = bodyStructureHasAttachment(msg.bodyStructure);
-          if (has === want) keep.add(eid);
+          const bs = boundBodyStructure(msg.bodyStructure);
+          if (bodyStructureHasAttachment(bs) === want) keep.add(eid);
           upserts.push({
             accountId: ctx.account.id,
             mailboxId: mailboxIdx,
             uidvalidity,
             uid,
-            bodystructure: JSON.stringify(msg.bodyStructure),
+            bodystructure: JSON.stringify(bs),
           });
+          if (upserts.length >= 256) {
+            ctx.store.upsertEmailCacheRows(upserts);
+            upserts = [];
+          }
         }
         ctx.store.upsertEmailCacheRows(upserts);
       });
@@ -794,9 +829,21 @@ export async function emailGet(
   if (Array.isArray(args.ids) && args.ids.length > (ctx.maxObjectsInGet ?? DEFAULT_MAX_OBJECTS_IN_GET)) {
     throw new JmapError("requestTooLarge", `at most ${ctx.maxObjectsInGet ?? DEFAULT_MAX_OBJECTS_IN_GET} ids per Email/get`);
   }
+  const budgets = ctx.budgets ?? newRequestBudgets();
   // The state these messages are read at; see viewState.
   const state = encodeEmailState({ uidvalidity: 0, modseq: viewState(ctx, ctx.client) });
-  const list: JmapEmail[] = [];
+  const projected: Record<string, unknown>[] = [];
+  // Every emitted header projection draws on budgets.projection, and every
+  // emitted property on budgets.response (see projectEmailForGet).
+  const properties = args.properties ? [...new Set(args.properties)] : undefined;
+  // RFC 8621 §4.1.3 header property grammar: a field name of printable ASCII
+  // without colon, an optional form, an optional :all. Anything else is not a
+  // property we can answer, and must not be echoed back as a key.
+  for (const p of properties ?? []) {
+    if (typeof p !== "string" || (p.startsWith("header:") && !/^header:[!-9;-~]{1,256}(?::as[A-Za-z]+)?(?::all)?$/.test(p))) {
+      throw invalidArguments(`invalid property: ${JSON.stringify(String(p)).slice(0, 80)}`);
+    }
+  }
   const notFound: string[] = [];
   // If the client picked an explicit property set, skip the preview FETCH
   // unless `preview` was requested. This is the common path for header-only
@@ -815,14 +862,17 @@ export async function emailGet(
     maxBodyValueBytes: args.maxBodyValueBytes,
     wantsPreview,
     needsFullHeaders,
-    // One budget for the whole request, across its mailbox groups.
-    headerBudget: { remaining: MAX_FULL_HEADER_BYTES_PER_CALL },
+    // One set of budgets for the whole request, across its mailbox groups.
+    headerBudget: budgets.header,
+    bodyBudget: budgets.body,
+    metadataBudget: budgets.metadata,
+    signal: budgets.signal,
   };
 
   // Group ids by mailbox so we can do one SELECT + one batched FETCH per
   // mailbox, instead of one per id. UI flows (open thread, open folder)
   // typically request many ids in the same mailbox.
-  type Group = { mailboxIdx: number; entries: { id: string; uid: number }[] };
+  type Group = { mailboxIdx: number; entries: { id: string; uid: number; uidvalidity: number }[] };
   const groups = new Map<number, Group>();
   // RFC 8620 §5.1: an id given more than once is answered once. Ids are
   // canonical (decodeEmailId), so one message is fetched and projected once.
@@ -843,7 +893,7 @@ export async function emailGet(
       g = { mailboxIdx: parts.mailboxIdx, entries: [] };
       groups.set(parts.mailboxIdx, g);
     }
-    g.entries.push({ id, uid: parts.uid });
+    g.entries.push({ id, uid: parts.uid, uidvalidity: parts.uidvalidity });
   }
 
   for (const group of groups.values()) {
@@ -856,15 +906,16 @@ export async function emailGet(
       for (const e of group.entries) notFound.push(e.id);
       continue;
     }
-    const uids = group.entries.map((e) => e.uid);
+    let current = group.entries;
     const fetched = await withMailbox(ctx.client, mboxRow.name, async () => {
       // Use the live uidvalidity from the SELECTed mailbox so the response
       // ids round-trip with what Email/query returned. The cached value in
       // the mailbox row starts at 0 and is never refreshed by listMailboxes.
-      const status = ctx.client.mailbox && typeof ctx.client.mailbox === "object" ? ctx.client.mailbox : null;
-      const liveUv = Number(
-        (status as { uidValidity?: number | bigint } | null)?.uidValidity ?? mboxRow.uidvalidity,
-      );
+      // Ids from another UIDVALIDITY epoch are stale: notFound, not fetched.
+      const liveUv = selectedUidValidity(ctx.client);
+      current = group.entries.filter((e) => e.uidvalidity === liveUv);
+      const uids = current.map((e) => e.uid);
+      if (liveUv === null || uids.length === 0) return new Map<number, JmapEmail>();
       const mailboxArg = {
         ...mboxRow,
         uidvalidity: liveUv,
@@ -878,22 +929,23 @@ export async function emailGet(
         subscribed: 0,
         last_seen: 0,
       } as never;
+      checkAborted(budgets.signal);
       return fetchEmailsBatch(ctx.client, ctx.account, mailboxArg, uids, bodyOpts, ctx.store);
+    }).catch((e) => {
+      if (e instanceof BudgetExceededError) throw new JmapError("requestTooLarge", e.message);
+      throw e;
     });
     for (const e of group.entries) {
-      const meta = fetched.get(e.uid);
+      const meta = current.includes(e) ? fetched.get(e.uid) : undefined;
       // The message found must be the one the id names: its id is built from
       // the live UIDVALIDITY, so an id with another epoch (or any other
       // spelling of the same UID) is notFound, and each message is listed once.
-      if (meta && meta.id === e.id) list.push(meta);
+      // Projected (and charged) as each group arrives, so a request over its
+      // budgets stops before holding every group's results.
+      if (meta && meta.id === e.id) projected.push(projectEmailForGet(meta, properties, budgets));
       else notFound.push(e.id);
     }
   }
-  // Header projections are bounded per request like the blocks they come
-  // from: every emitted `headers` / `header:*` value draws on one allowance.
-  const projectionBudget = { remaining: MAX_FULL_HEADER_BYTES_PER_CALL };
-  const properties = args.properties ? [...new Set(args.properties)] : undefined;
-  const projected = list.map((e) => projectEmailForGet(e, properties, projectionBudget));
   return {
     accountId: args.accountId,
     state,
@@ -909,16 +961,18 @@ export async function emailGet(
 function projectEmailForGet(
   email: JmapEmail,
   properties: string[] | undefined,
-  budget: { remaining: number } = { remaining: MAX_FULL_HEADER_BYTES_PER_CALL },
+  budgets: Pick<RequestBudgets, "projection" | "response">,
 ): Record<string, unknown> {
-  const charge = <T>(value: T): T => {
-    budget.remaining -= projectedChars(value);
-    if (budget.remaining < 0) {
-      throw new JmapError(
-        "requestTooLarge",
-        `header projections exceed ${MAX_FULL_HEADER_BYTES_PER_CALL} characters; request fewer ids or header properties`,
-      );
+  const tooLarge = (what: string, limit: number) =>
+    new JmapError("requestTooLarge", `${what} exceed ${limit} characters; request fewer ids or properties`);
+  const emit = <T>(value: T, header: boolean): T => {
+    const n = projectedChars(value);
+    if (header) {
+      budgets.projection.remaining -= n;
+      if (budgets.projection.remaining < 0) throw tooLarge("header projections", MAX_FULL_HEADER_BYTES_PER_CALL);
     }
+    budgets.response.remaining -= n;
+    if (budgets.response.remaining < 0) throw tooLarge("Email/get responses", MAX_RESPONSE_CHARS);
     return value;
   };
   const headers = email._headers;
@@ -932,36 +986,31 @@ function projectEmailForGet(
     "bodyStructure", "textBody", "htmlBody", "attachments", "bodyValues",
   ];
   const props = properties ?? defaultProps;
-  const out: Record<string, unknown> = { id: email.id };
+  const out: Record<string, unknown> = { id: emit(email.id, false) };
   for (const p of props) {
     if (p === "id") continue;
+    // The key goes out too, escaped.
+    budgets.response.remaining -= Buffer.byteLength(JSON.stringify(p));
     if (p.startsWith("header:")) {
-      out[p] = charge(projectHeaderProp(headers, p));
+      out[p] = emit(projectHeaderProp(headers, p), true);
       continue;
     }
     if (p === "headers") {
-      out.headers = charge(headersToEmailHeaders(headers));
+      out.headers = emit(headersToEmailHeaders(headers), true);
       continue;
     }
     // Plain top-level property; copy through if we have it.
     if (Object.prototype.hasOwnProperty.call(email, p)) {
-      out[p] = (email as unknown as Record<string, unknown>)[p];
+      out[p] = emit((email as unknown as Record<string, unknown>)[p], false);
     }
   }
   return out;
 }
 
-// Characters of the strings in a projected header value (names included):
-// what it adds to the response, give or take JSON punctuation.
+// Bytes a projected value adds to the serialized response: its JSON, escapes
+// and UTF-8 included, plus room for the property name around it.
 function projectedChars(v: unknown): number {
-  if (typeof v === "string") return v.length;
-  if (Array.isArray(v)) return v.reduce((n: number, x) => n + projectedChars(x) + 2, 0);
-  if (v && typeof v === "object") {
-    let n = 0;
-    for (const [k, x] of Object.entries(v)) n += k.length + projectedChars(x) + 2;
-    return n;
-  }
-  return 4;
+  return Buffer.byteLength(JSON.stringify(v) ?? "null") + 64;
 }
 
 // Account-wide email state used by Email/get and Email/set. Bumped by Email/set
@@ -1204,6 +1253,7 @@ interface UpdateOp {
   id: string;
   patch: Record<string, unknown>;
   uid: number;
+  uidvalidity: number;
   srcMbox: MailboxLookup;
   resolved: ResolvedPatch;
   destMbox: MailboxLookup | null;
@@ -1280,7 +1330,15 @@ async function applyEmailUpdatesBatched(
         const target = lookupMailboxByEncodedId(ctx.store, ctx.account.id, first);
         if (target.id !== srcMbox.id) destMbox = target;
       }
-      const op: UpdateOp = { id, patch: patch as Record<string, unknown>, uid: parts.uid, srcMbox, resolved, destMbox };
+      const op: UpdateOp = {
+        id,
+        patch: patch as Record<string, unknown>,
+        uid: parts.uid,
+        uidvalidity: parts.uidvalidity,
+        srcMbox,
+        resolved,
+        destMbox,
+      };
       const key = `${srcMbox.id}|${updateOpSignature(op)}`;
       const arr = groups.get(key) ?? [];
       arr.push(op);
@@ -1290,11 +1348,15 @@ async function applyEmailUpdatesBatched(
     }
   }
 
-  for (const ops of groups.values()) {
-    const { srcMbox, resolved, destMbox } = ops[0]!;
-    const uids = ops.map((o) => o.uid);
+  for (const allOps of groups.values()) {
+    const { srcMbox, resolved, destMbox } = allOps[0]!;
+    let ops = allOps;
+    let uids = ops.map((o) => o.uid);
     try {
       await withMailbox(ctx.client, srcMbox.name, async () => {
+        ops = allOps.filter((o) => isCurrentEpoch(ctx.client, o.uidvalidity));
+        uids = ops.map((o) => o.uid);
+        if (ops.length === 0) return;
         // Flag changes precede the move: after MOVE the source UIDs are gone.
         if (resolved.keywordSet !== null) {
           const flags = Object.keys(resolved.keywordSet).map(keywordToFlag);
@@ -1316,6 +1378,8 @@ async function applyEmailUpdatesBatched(
           }
         }
       });
+      for (const op of allOps) if (!ops.includes(op)) out.notUpdated[op.id] = toSetError(notFound());
+      if (ops.length === 0) continue;
       if (destMbox) {
         // Source rows are gone; the copies in destMbox have new UIDs that the
         // next scan / Email/get will cache under their own ids.
@@ -1350,7 +1414,7 @@ async function applyEmailDestroysBatched(
     touchedMailboxes: Set<number>;
   },
 ): Promise<void> {
-  const groups = new Map<number, { mbox: MailboxLookup; entries: { id: string; uid: number }[] }>();
+  const groups = new Map<number, { mbox: MailboxLookup; entries: { id: string; uid: number; uidvalidity: number }[] }>();
   for (const id of ids) {
     try {
       const parts = decodeEmailIdSafe(id);
@@ -1362,19 +1426,25 @@ async function applyEmailDestroysBatched(
         g = { mbox, entries: [] };
         groups.set(mbox.id, g);
       }
-      g.entries.push({ id, uid: parts.uid });
+      g.entries.push({ id, uid: parts.uid, uidvalidity: parts.uidvalidity });
     } catch (e) {
       out.notDestroyed[id] = toSetError(e);
     }
   }
   for (const g of groups.values()) {
-    const uids = g.entries.map((e) => e.uid);
     try {
-      await withMailbox(ctx.client, g.mbox.name, async () => {
-        await ctx.client.messageDelete(uids, { uid: true });
+      const fresh = await withMailbox(ctx.client, g.mbox.name, async () => {
+        const current = g.entries.filter((e) => isCurrentEpoch(ctx.client, e.uidvalidity));
+        if (current.length > 0) {
+          await ctx.client.messageDelete(current.map((e) => e.uid), { uid: true });
+        }
+        return current;
       });
-      ctx.store.deleteEmailCacheUids(ctx.account.id, g.mbox.id, uids);
-      for (const e of g.entries) out.destroyed.push(e.id);
+      const freshIds = new Set(fresh.map((e) => e.id));
+      for (const e of g.entries) if (!freshIds.has(e.id)) out.notDestroyed[e.id] = toSetError(notFound());
+      if (fresh.length === 0) continue;
+      ctx.store.deleteEmailCacheUids(ctx.account.id, g.mbox.id, fresh.map((e) => e.uid));
+      for (const e of fresh) out.destroyed.push(e.id);
       out.touchedMailboxes.add(g.mbox.id);
     } catch {
       for (const e of g.entries) {
@@ -1450,6 +1520,7 @@ export async function applyEmailUpdate(
   // Apply flag changes in the source mailbox first, then move. After MOVE the
   // UID in the source is gone, so flag operations must precede the move.
   await withMailbox(ctx.client, srcMbox.name, async () => {
+    assertCurrentEpoch(ctx.client, parts.uidvalidity);
     if (resolved.keywordSet !== null) {
       const flags = Object.keys(resolved.keywordSet).map(keywordToFlag);
       await ctx.client.messageFlagsSet(`${parts.uid}`, flags, { uid: true });
@@ -1497,16 +1568,14 @@ export async function refileByAppend(client: ImapFlow, uid: number, destName: st
   }
 }
 
-function referencedBlobIds(create: JmapEmailCreate): Set<string> {
-  const out = new Set<string>();
-  const walk = (p: BodyStructurePart): void => {
-    if (p.blobId) out.add(p.blobId);
-    p.subParts?.forEach(walk);
-  };
-  if (create.bodyStructure) walk(create.bodyStructure);
-  create.attachments?.forEach(walk);
-  return out;
-}
+// The advertised maxSizeAttachmentsPerEmail; here it bounds everything a
+// draft's MIME is built from: every occurrence of every blob and body value.
+export const MAX_COMPOSE_CONTENT_BYTES = 50_000_000;
+// Worst-case transfer-encoding growth, line breaks included, and a generous
+// allowance for headers and multipart boundaries.
+const QP_WORST = (3 * 79) / 76;
+const BASE64_WORST = (4 / 3) * (78 / 76);
+const MIME_OVERHEAD_BYTES = 1024 * 1024;
 
 interface CreatedEmailResult {
   id: string;
@@ -1567,10 +1636,34 @@ async function applyEmailCreate(
   // buildRfc822 looks blobs up synchronously, so load them first. Besides
   // uploads these can be parts of existing mail: a re-opened draft or a
   // forward references its attachments by their part blobIds.
+  // One budget for all of it, checked before each blob is loaded (from its
+  // stored size, or while streaming it) rather than after.
+  const tooLarge = () =>
+    new JmapError("tooLarge", `attachments and body exceed ${MAX_COMPOSE_CONTENT_BYTES} bytes`);
+  const uses = mimeContentPlan(payload as JmapEmailCreate);
+  let remaining = MAX_COMPOSE_CONTENT_BYTES - uses.textBytes;
+  // And what the encoding can make of it, before any encoder runs: at worst
+  // quoted-printable (3 bytes per byte plus soft breaks) for text, base64 for
+  // blobs, plus headers and structure. The MIME encoder takes each part whole,
+  // so its output has to be bounded up front, not while it streams.
+  let encodedRemaining = MAX_MIME_BYTES - MIME_OVERHEAD_BYTES - Math.ceil(uses.textBytes * QP_WORST);
+  if (remaining < 0 || encodedRemaining < 0) throw tooLarge();
   const blobs = new Map<string, { body: Buffer; ctype: string }>();
-  for (const blobId of referencedBlobIds(payload as JmapEmailCreate)) {
-    const blob = await readBlob(blobId, ctx);
-    if (blob) blobs.set(blobId, blob);
+  for (const [blobId, count] of uses.blobs) {
+    checkAborted(ctx.budgets?.signal);
+    let blob;
+    try {
+      const max = Math.min(Math.floor(remaining / count), Math.floor(encodedRemaining / (count * BASE64_WORST)));
+      blob = await readBlob(blobId, ctx, max);
+    } catch (e) {
+      if (e instanceof BlobTooLargeError) throw tooLarge();
+      throw e;
+    }
+    if (!blob) continue;
+    remaining -= blob.body.length * count;
+    encodedRemaining -= Math.ceil(blob.body.length * count * BASE64_WORST);
+    if (remaining < 0 || encodedRemaining < 0) throw tooLarge();
+    blobs.set(blobId, blob);
   }
 
   let mime: Buffer;
@@ -1581,6 +1674,7 @@ async function applyEmailCreate(
       (blobId) => blobs.get(blobId) ?? null,
     );
   } catch (e) {
+    if (e instanceof MessageTooLargeError) throw new JmapError("tooLarge", e.message);
     // RFC 8621 §4.6: a part referencing an unknown blob fails the create.
     if (e instanceof MissingBlobError) {
       throw new JmapError("blobNotFound", e.message, { notFound: [e.blobId] });
@@ -1623,8 +1717,22 @@ async function applyEmailDestroy(
   const mbox = lookupMailboxByIdx(ctx.store, ctx.account.id, parts.mailboxIdx);
   if (!mbox) throw notFound();
   await withMailbox(ctx.client, mbox.name, async () => {
+    assertCurrentEpoch(ctx.client, parts.uidvalidity);
     await ctx.client.messageDelete(`${parts.uid}`, { uid: true });
   });
+}
+
+// Every read or write addressed by an email id runs under the mailbox lock and
+// first checks that the selected mailbox still has the id's UIDVALIDITY. A
+// stale id (the mailbox was recreated or restored since) is notFound, never
+// the message that now happens to carry the same UID.
+function isCurrentEpoch(client: ImapFlow, uidvalidity: number): boolean {
+  const live = selectedUidValidity(client);
+  return live !== null && live === uidvalidity;
+}
+
+function assertCurrentEpoch(client: ImapFlow, uidvalidity: number): void {
+  if (!isCurrentEpoch(client, uidvalidity)) throw notFound();
 }
 
 function decodeEmailIdSafe(id: string): ReturnType<typeof decodeEmailId> {
@@ -2114,6 +2222,7 @@ async function applyEmailCopy(
   const target = lookupMailboxByEncodedId(ctx.store, ctx.account.id, targetIds[0]!);
 
   const copyResult = await withMailbox(ctx.client, srcMbox.name, async () => {
+    assertCurrentEpoch(ctx.client, srcParts.uidvalidity);
     return ctx.client.messageCopy(`${srcParts.uid}`, target.name, { uid: true });
   });
   if (!copyResult) {
