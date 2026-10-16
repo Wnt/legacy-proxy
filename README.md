@@ -69,18 +69,25 @@ Changes from upstream:
     can't have a larger header and keeps the cheap `HEADER.FIELDS` fetch.
     This costs one extra FETCH round trip for uncached messages. Blocks are
     handled one at a time: each is reduced at once to its threading inputs
-    (Message-ID, In-Reply-To and References id lists, each kept up to 32 KiB),
-    the thread scan writes rows in batches of 256, and one Email/get keeps at
-    most 16 MiB of full header blocks for `headers`/`header:*` (later
-    messages in that call get none). The threading inputs are derived once
-    per message and cached with it (`email_cache.thread_inputs`, first writer
-    wins), so Email/get with or without full headers and the thread scan
-    always give a message the same threadId and `references`. Each unfolded
-    field is parsed up to 128 KiB; message ids holding a stray `<` or longer
-    than 998 characters are skipped, so threading falls back to the next
+    (the first Message-ID and In-Reply-To, and References up to 16 KiB), and
+    the thread scan writes rows in batches of 256. One Email/get holds at
+    most 16 MiB of full header blocks for `headers`/`header:*`, cached and
+    fetched alike and across all its mailboxes (later messages get none);
+    the cache's message rows are read without their header blobs, which are
+    loaded one at a time within that budget and only when asked for. Email/get
+    also refuses more ids than the advertised `maxObjectsInGet`. Threading
+    inputs are derived once per message and cached with it
+    (`email_cache.thread_inputs`, first writer wins within one UIDVALIDITY;
+    a reused UID under a new UIDVALIDITY replaces the whole row), so Email/get
+    with or without full headers and the thread scan always give a message
+    the same threadId and `references`. A cached block that is only the
+    bounded prefix of a larger header is marked `headers_truncated`. Each
+    unfolded field is parsed up to 128 KiB; message ids holding a stray `<`
+    or longer than 998 characters are skipped, so threading falls back to the next
     reference or the message's own id. On first start the message cache and
     scan checkpoints are dropped once (`PRAGMA user_version` 1) and every
-    state moves, so caches are rebuilt this way and clients resync. imapflow's
+    state moves, including each account's never-written email and mailbox
+    states, so caches are rebuilt this way and clients resync. imapflow's
     literal/response/line limits are lowered from 1/2/1 GiB to
     128/160/16 MiB as a backstop. Code: `src/imap/headers.ts`,
     `src/imap/fetcher.ts`, `src/jmap/methods/threads.ts`,

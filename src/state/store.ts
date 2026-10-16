@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS email_cache (
   created_at    INTEGER NOT NULL,
   -- ThreadInputs JSON (src/imap/headers.ts): what thread_id was derived from.
   thread_inputs TEXT,
+  -- 1 when headers_raw is only the bounded prefix of a larger header block.
+  headers_truncated INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (account_id, mailbox_id, uid)
 );
 CREATE INDEX IF NOT EXISTS email_cache_thread_idx ON email_cache(account_id, thread_id);
@@ -213,7 +215,22 @@ export class Store {
         if (!cols.some((c) => c.name === "thread_inputs")) {
           this.db.exec(`ALTER TABLE email_cache ADD COLUMN thread_inputs TEXT`);
         }
-        this.db.exec(`DELETE FROM email_cache; DELETE FROM mailbox_scan; UPDATE state_log SET state = state + 1;`);
+        if (!cols.some((c) => c.name === "headers_truncated")) {
+          this.db.exec(`ALTER TABLE email_cache ADD COLUMN headers_truncated INTEGER NOT NULL DEFAULT 0`);
+        }
+        this.db.exec(`DELETE FROM email_cache; DELETE FROM mailbox_scan;`);
+        // Move every recorded state, and give every account an email and a
+        // mailbox state past the implicit 0, so no client's saved state
+        // still matches (Email/changes and Thread/changes use "email").
+        const now = Date.now();
+        this.db.prepare(`UPDATE state_log SET state = state + 1, at = ?`).run(now);
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO state_log(account_id, kind, state, at)
+             SELECT a.id, k.kind, 1, ? FROM account a
+             CROSS JOIN (SELECT 'email' AS kind UNION ALL SELECT 'mailbox') k`,
+          )
+          .run(now);
         this.db.pragma("user_version = 1");
       })();
     }
@@ -601,8 +618,14 @@ export class Store {
     const out = new Map<number, EmailCacheRow>();
     for (let i = 0; i < uids.length; i += Store.IN_CHUNK) {
       const chunk = uids.slice(i, i + Store.IN_CHUNK);
+      // Every column but the header block, which can be large: callers
+      // that want it read it per message within their budget
+      // (getEmailCacheHeaders).
       const rows = this.prep(
-          `SELECT * FROM email_cache
+          `SELECT account_id, mailbox_id, uidvalidity, uid, thread_id, internaldate, size,
+                  envelope, bodystructure, headers_full, headers_truncated, preview,
+                  created_at, thread_inputs, length(headers_raw) AS headers_len
+           FROM email_cache
            WHERE account_id = ? AND mailbox_id = ? AND uidvalidity = ?
            AND uid IN (${chunk.map(() => "?").join(",")})`,
         )
@@ -610,6 +633,16 @@ export class Store {
       for (const r of rows) out.set(r.uid, r);
     }
     return out;
+  }
+
+  /** The cached header block of one message, as stored by Email/get. */
+  getEmailCacheHeaders(accountId: number, mailboxId: number, uidvalidity: number, uid: number): Buffer | null {
+    const row = this.prep(
+        `SELECT headers_raw FROM email_cache
+         WHERE account_id = ? AND mailbox_id = ? AND uidvalidity = ? AND uid = ?`,
+      )
+      .get(accountId, mailboxId, uidvalidity, uid) as { headers_raw: Buffer | null } | undefined;
+    return row?.headers_raw ?? null;
   }
 
   // Upsert semantics: a minimal row (thread scan) must never null out a full
@@ -621,22 +654,37 @@ export class Store {
       `INSERT INTO email_cache(
          account_id, mailbox_id, uidvalidity, uid, thread_id, internaldate,
          size, envelope, bodystructure, headers_raw, headers_full, preview, created_at,
-         thread_inputs
-       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         thread_inputs, headers_truncated
+       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(account_id, mailbox_id, uid) DO UPDATE SET
+         -- The row is keyed by UID only. A different UIDVALIDITY means a
+         -- different message that reuses the UID: replace every field. (All
+         -- column references on the right are the old row's values.)
          uidvalidity   = excluded.uidvalidity,
-         -- A message's threading is derived once: the first writer wins, so
-         -- the thread scan and Email/get can never disagree about it later.
-         thread_id     = COALESCE(thread_id, excluded.thread_id),
-         thread_inputs = COALESCE(thread_inputs, excluded.thread_inputs),
-         internaldate  = MAX(excluded.internaldate, internaldate),
-         size          = COALESCE(excluded.size, size),
-         envelope      = COALESCE(excluded.envelope, envelope),
-         bodystructure = COALESCE(excluded.bodystructure, bodystructure),
-         headers_raw   = CASE WHEN excluded.headers_full >= headers_full AND excluded.headers_raw IS NOT NULL
+         -- Within one epoch a message's threading is derived once: the first
+         -- writer wins, so the thread scan and Email/get never disagree.
+         thread_id     = CASE WHEN uidvalidity = excluded.uidvalidity
+                              THEN COALESCE(thread_id, excluded.thread_id) ELSE excluded.thread_id END,
+         thread_inputs = CASE WHEN uidvalidity = excluded.uidvalidity
+                              THEN COALESCE(thread_inputs, excluded.thread_inputs) ELSE excluded.thread_inputs END,
+         internaldate  = CASE WHEN uidvalidity = excluded.uidvalidity
+                              THEN MAX(excluded.internaldate, internaldate) ELSE excluded.internaldate END,
+         size          = CASE WHEN uidvalidity = excluded.uidvalidity
+                              THEN COALESCE(excluded.size, size) ELSE excluded.size END,
+         envelope      = CASE WHEN uidvalidity = excluded.uidvalidity
+                              THEN COALESCE(excluded.envelope, envelope) ELSE excluded.envelope END,
+         bodystructure = CASE WHEN uidvalidity = excluded.uidvalidity
+                              THEN COALESCE(excluded.bodystructure, bodystructure) ELSE excluded.bodystructure END,
+         headers_raw   = CASE WHEN uidvalidity <> excluded.uidvalidity THEN excluded.headers_raw
+                              WHEN excluded.headers_full >= headers_full AND excluded.headers_raw IS NOT NULL
                               THEN excluded.headers_raw ELSE headers_raw END,
-         headers_full  = MAX(excluded.headers_full, headers_full),
-         preview       = COALESCE(excluded.preview, preview)`,
+         headers_truncated = CASE WHEN uidvalidity <> excluded.uidvalidity THEN excluded.headers_truncated
+                              WHEN excluded.headers_full >= headers_full AND excluded.headers_raw IS NOT NULL
+                              THEN excluded.headers_truncated ELSE headers_truncated END,
+         headers_full  = CASE WHEN uidvalidity = excluded.uidvalidity
+                              THEN MAX(excluded.headers_full, headers_full) ELSE excluded.headers_full END,
+         preview       = CASE WHEN uidvalidity = excluded.uidvalidity
+                              THEN COALESCE(excluded.preview, preview) ELSE excluded.preview END`,
     );
     const now = Date.now();
     const txn = this.db.transaction((items: EmailCacheUpsert[]) => {
@@ -646,6 +694,7 @@ export class Store {
           r.threadId ?? null, r.internaldate ?? 0, r.size ?? null,
           r.envelope ?? null, r.bodystructure ?? null, r.headersRaw ?? null,
           r.headersFull ? 1 : 0, r.preview ?? null, now, r.threadInputs ?? null,
+          r.headersTruncated ? 1 : 0,
         );
       }
     });
@@ -739,8 +788,12 @@ export interface EmailCacheRow {
   size: number | null;
   envelope: string | null;
   bodystructure: string | null;
-  headers_raw: Buffer | null;
+  /** Not selected by getEmailCacheRows; see headers_len / getEmailCacheHeaders. */
+  headers_raw?: Buffer | null;
+  /** Byte length of the cached header block, or null when none is cached. */
+  headers_len?: number | null;
   headers_full: number;
+  headers_truncated?: number;
   preview: string | null;
   created_at: number;
   thread_inputs: string | null;
@@ -761,6 +814,8 @@ export interface EmailCacheUpsert {
   preview?: string | null;
   /** ThreadInputs JSON; written with threadId. */
   threadInputs?: string | null;
+  /** headersRaw is the bounded prefix of a larger header block. */
+  headersTruncated?: boolean;
 }
 
 export interface ThreadIndexRow {

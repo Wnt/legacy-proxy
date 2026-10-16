@@ -175,7 +175,10 @@ function makeMethodTable(): Record<string, Handler> {
       ),
     "Email/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
-        emailGet(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
+        emailGet(a as never, {
+          account: c.account, client, store: c.store, pool: c.pool,
+          maxObjectsInGet: c.cfg.limits.maxObjectsInGet,
+        }),
       ),
     "Email/set": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>

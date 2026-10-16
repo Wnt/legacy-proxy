@@ -273,3 +273,117 @@ describe("bounded retention", () => {
     expect(new Set(uids.map((u) => got.get(u)!.threadId))).toEqual(new Set([ROOT]));
   });
 });
+
+describe("review round 3", () => {
+  const LARGE = Buffer.from(`References: <root@example.test>\r\n${FILLER}\r\n`, "latin1").subarray(0, MAX_HEADER_BLOCK_BYTES);
+
+  function manyServer(block: Buffer) {
+    return {
+      async *fetch(range: string, query: any) {
+        const want = String(range).split(",").flatMap((r) => { const [a, b] = r.split(":").map(Number); return Array.from({ length: (b ?? a!) - a! + 1 }, (_, i) => a! + i); });
+        for (const uid of want) {
+          if (query.bodyParts) yield { uid, headers: block.subarray(0, query.bodyParts[0].maxLength) };
+          else if (query.headers) yield { uid, headers: block };
+          else yield { uid, flags: new Set(), size: block.length * 2, internalDate: new Date(0),
+            envelope: { messageId: "<own@example.test>" }, bodyStructure: { part: "1", type: "text/plain", encoding: "7bit", size: 1 } };
+        }
+      },
+    } as never;
+  }
+
+  it("cached header blocks draw on the same budget, and metadata reads never load them", async () => {
+    const d = mkdtempSync(path.join(tmpdir(), "hdrfetch-"));
+    const s = seededStore(d);
+    const n = 40;
+    const uids = Array.from({ length: n }, (_, i) => i + 1);
+    // Fill the cache with 40 full blocks in two legitimate reads of 20.
+    for (const half of [uids.slice(0, 20), uids.slice(20)]) {
+      await fetchEmailsBatch(manyServer(LARGE), account, mailbox, half, { wantsPreview: false, needsFullHeaders: true }, s);
+    }
+    let loaded = 0;
+    const orig = s.getEmailCacheHeaders.bind(s);
+    s.getEmailCacheHeaders = (...a) => {
+      const b = orig(...a);
+      loaded += b?.length ?? 0;
+      return b;
+    };
+    // Warm: all 40 from cache in one call.
+    const got = await fetchEmailsBatch(manyServer(LARGE), account, mailbox, uids, { wantsPreview: false, needsFullHeaders: true }, s);
+    expect(loaded).toBeLessThanOrEqual(MAX_FULL_HEADER_BYTES_PER_CALL);
+    expect(uids.filter((u) => got.get(u)!._headers.length > 0).length * MAX_HEADER_BLOCK_BYTES).toBeLessThanOrEqual(MAX_FULL_HEADER_BYTES_PER_CALL);
+    expect(new Set(uids.map((u) => got.get(u)!.threadId))).toEqual(new Set([ROOT]));
+    // Metadata only: no header blob is read at all.
+    loaded = 0;
+    await fetchEmailsBatch(manyServer(LARGE), account, mailbox, uids, { wantsPreview: false }, s);
+    expect(loaded).toBe(0);
+    // Two groups (mailboxes) of one request share one budget.
+    loaded = 0;
+    const shared = { remaining: MAX_FULL_HEADER_BYTES_PER_CALL };
+    await fetchEmailsBatch(manyServer(LARGE), account, mailbox, uids.slice(0, 20), { wantsPreview: false, needsFullHeaders: true, headerBudget: shared }, s);
+    await fetchEmailsBatch(manyServer(LARGE), account, mailbox, uids.slice(20), { wantsPreview: false, needsFullHeaders: true, headerBudget: shared }, s);
+    expect(loaded).toBeLessThanOrEqual(MAX_FULL_HEADER_BYTES_PER_CALL);
+    s.db.close();
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("marks a header block cut at the bound as truncated", async () => {
+    const d = mkdtempSync(path.join(tmpdir(), "hdrfetch-"));
+    const s = seededStore(d);
+    await fetchEmailsBatch(manyServer(LARGE), account, mailbox, [1], { wantsPreview: false, needsFullHeaders: true }, s);
+    const { client } = fakeServer(Buffer.from("References: <root@example.test>\r\n\r\n"));
+    await fetchEmailsBatch(client, account, mailbox, [7], { wantsPreview: false, needsFullHeaders: true }, s);
+    const rows = s.getEmailCacheRows(1, 2, 1, [1, 7]);
+    expect(rows.get(1)!.headers_truncated).toBe(1);
+    expect(rows.get(7)!.headers_truncated).toBe(0);
+    s.db.close();
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it.each(["get-first", "scan-first"])("a UID reused under a new UIDVALIDITY gets the new message's threading (%s)", async (order) => {
+    const d = mkdtempSync(path.join(tmpdir(), "hdrfetch-"));
+    const s = seededStore(d);
+    const OLD = computeThreadIdFromHeaders(parseHeaderBlock("References: <old@x>\r\n\r\n"), null);
+    const NEW = computeThreadIdFromHeaders(parseHeaderBlock("References: <new@x>\r\n\r\n"), null);
+    if (order === "get-first") {
+      const { client } = fakeServer(Buffer.from("References: <old@x>\r\n\r\n"));
+      await fetchEmailsBatch(client, account, { id: 2, uidvalidity: 100 } as never, [7], { wantsPreview: false }, s);
+    } else {
+      s.upsertEmailCacheRows([{ accountId: 1, mailboxId: 2, uidvalidity: 100, uid: 7, threadId: OLD!, internaldate: 0,
+        threadInputs: JSON.stringify({ messageId: null, inReplyTo: null, references: ["old@x"] }) }]);
+    }
+    for (let i = 0; i < 2; i++) {
+      const { client } = fakeServer(Buffer.from("References: <new@x>\r\n\r\n"));
+      const got = (await fetchEmailsBatch(client, account, { id: 2, uidvalidity: 200 } as never, [7], { wantsPreview: false }, s)).get(7)!;
+      expect(got.threadId).toBe(NEW);
+      expect(got.references).toEqual(["new@x"]);
+    }
+    expect(s.getThreadIndexRows(1)).toMatchObject([{ uidvalidity: 200, thread_id: NEW }]);
+    s.db.close();
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("the upgrade moves implicit (never written) states too, so */changes resync", async () => {
+    const { emailChanges } = await import("../../src/jmap/methods/email.js");
+    const { threadChanges } = await import("../../src/jmap/methods/threads.js");
+    const { encodeEmailState } = await import("../../src/state/states.js");
+    const d = mkdtempSync(path.join(tmpdir(), "hdrfetch-"));
+    const s1 = seededStore(d);
+    expect(s1.getState(1, "email")).toBe(0);
+    s1.db.pragma("user_version = 0");
+    s1.db.close();
+    const s2 = new Store(d);
+    const acct = s2.getAccountById(1)!;
+    expect(s2.getState(1, "email")).toBeGreaterThan(0);
+    const since = encodeEmailState({ uidvalidity: 0, modseq: 0 });
+    await expect(emailChanges({ accountId: "1", sinceState: since }, { account: acct, store: s2 })).rejects.toMatchObject({ type: "cannotCalculateChanges" });
+    await expect(threadChanges({ accountId: "1", sinceState: since }, { account: acct, store: s2 } as never)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
+    s2.db.close();
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("Email/get refuses more ids than maxObjectsInGet", async () => {
+    const { emailGet } = await import("../../src/jmap/methods/email.js");
+    const ctx = { account: { id: 1 }, client: {}, store: { getState: () => 1 }, maxObjectsInGet: 3 } as never;
+    await expect(emailGet({ accountId: "1", ids: ["a", "b", "c", "d"] }, ctx)).rejects.toMatchObject({ type: "requestTooLarge" });
+  });
+});

@@ -130,6 +130,11 @@ export interface BodyFetchOpts {
   // True when the client requested a `header:*` projection, which needs the
   // complete header block rather than the threading subset.
   needsFullHeaders?: boolean;
+  // Bytes of full header blocks this request may still hold, shared by every
+  // fetchEmailsBatch of one Email/get (one per mailbox). Cached and freshly
+  // fetched blocks both draw on it; a message past it is answered without
+  // `headers`/`header:*` values. Defaults to a fresh MAX_FULL_HEADER_BYTES_PER_CALL.
+  headerBudget?: { remaining: number };
 }
 
 function decodePartText(buf: Buffer, charset: string | null): string {
@@ -230,6 +235,8 @@ interface RawMeta {
   // otherwise null (headersFull false).
   headersRaw: Buffer | null;
   headersFull: boolean;
+  // headersRaw is the bounded prefix of a larger header block.
+  headersTruncated: boolean;
   // What threadId and `references` derive from, computed once per message.
   thread: ThreadInputs;
   preview: string | null;
@@ -258,7 +265,12 @@ function headersToBuffer(headers: FetchMessageObject["headers"]): Buffer {
   return buf.length > MAX_HEADER_BLOCK_BYTES ? Buffer.from(buf.subarray(0, MAX_HEADER_BLOCK_BYTES)) : buf;
 }
 
-function rawFromFetch(msg: FetchMessageObject, thread: ThreadInputs, headersRaw: Buffer | null): RawMeta {
+function rawFromFetch(
+  msg: FetchMessageObject,
+  thread: ThreadInputs,
+  headersRaw: Buffer | null,
+  headersTruncated: boolean,
+): RawMeta {
   return {
     uid: msg.uid!,
     flags: new Set(msg.flags ?? []),
@@ -268,6 +280,7 @@ function rawFromFetch(msg: FetchMessageObject, thread: ThreadInputs, headersRaw:
     bodystructure: msg.bodyStructure ?? null,
     headersRaw,
     headersFull: headersRaw !== null,
+    headersTruncated,
     thread,
     preview: null,
     fromCache: false,
@@ -497,7 +510,10 @@ export async function fetchEmailsBatch(
   const out = new Map<number, JmapEmail>();
   if (uids.length === 0) return out;
   const needsFull = bodyOpts.needsFullHeaders === true;
+  const budget = bodyOpts.headerBudget ?? { remaining: MAX_FULL_HEADER_BYTES_PER_CALL };
 
+  // Scalar columns only; a cached header block is read below, one at a time
+  // and only within the budget.
   const cachedRows = store
     ? store.getEmailCacheRows(account.id, mailbox.id, mailbox.uidvalidity, uids)
     : new Map<number, never>();
@@ -511,14 +527,20 @@ export async function fetchEmailsBatch(
       thread &&
       row.envelope !== null &&
       row.bodystructure !== null &&
-      (!needsFull || (row.headers_full === 1 && row.headers_raw !== null))
+      (!needsFull || (row.headers_full === 1 && (row.headers_len ?? 0) > 0))
     ) {
       try {
         const envelope = JSON.parse(row.envelope) as EnvelopeLike | null;
         const bodystructure = JSON.parse(row.bodystructure);
         // Rows written before the guards above can hold the string "null".
         if (!envelope || !bodystructure) throw new Error("incomplete cache row");
-        const full = row.headers_full === 1 && row.headers_raw !== null;
+        let headersRaw: Buffer | null = null;
+        const len = row.headers_len ?? 0;
+        if (needsFull && store && len <= budget.remaining) {
+          budget.remaining -= len;
+          headersRaw = headersToBuffer(store.getEmailCacheHeaders(account.id, mailbox.id, mailbox.uidvalidity, uid) ?? undefined);
+        }
+        const full = headersRaw !== null;
         raws.set(uid, {
           uid,
           flags: null,
@@ -526,8 +548,9 @@ export async function fetchEmailsBatch(
           internaldate: row.internaldate,
           envelope,
           bodystructure,
-          headersRaw: full ? headersToBuffer(row.headers_raw ?? undefined) : null,
+          headersRaw,
           headersFull: full,
+          headersTruncated: row.headers_truncated === 1,
           thread,
           preview: row.preview,
           fromCache: true,
@@ -552,8 +575,7 @@ export async function fetchEmailsBatch(
     // One block at a time: derive the ThreadInputs (or reuse the ones the
     // thread scan already cached for this message), keep the full block only
     // when asked for and within the call's budget.
-    let fullBudget = MAX_FULL_HEADER_BYTES_PER_CALL;
-    const reduced = new Map<number, { thread: ThreadInputs; full: Buffer | null }>();
+    const reduced = new Map<number, { thread: ThreadInputs; full: Buffer | null; truncated: boolean }>();
     for await (const { uid, block } of headerBlocksBounded(
       client,
       [...fetchedMeta.keys()],
@@ -562,15 +584,17 @@ export async function fetchEmailsBatch(
     )) {
       const thread = parseThreadInputs(cachedRows.get(uid)?.thread_inputs) ?? threadInputs(parseHeaderBlock(block));
       let full: Buffer | null = null;
-      if (needsFull && block.length <= fullBudget) {
-        fullBudget -= block.length;
+      if (needsFull && block.length <= budget.remaining) {
+        budget.remaining -= block.length;
         full = block;
       }
-      reduced.set(uid, { thread, full });
+      // A block that fills the bound of a larger message is only its prefix.
+      const truncated = block.length >= MAX_HEADER_BLOCK_BYTES && (fetchedMeta.get(uid)?.size ?? Infinity) > block.length;
+      reduced.set(uid, { thread, full, truncated });
     }
     for (const [uid, m] of fetchedMeta) {
       const r = reduced.get(uid);
-      raws.set(uid, rawFromFetch(m, r?.thread ?? EMPTY_THREAD, r?.full ?? null));
+      raws.set(uid, rawFromFetch(m, r?.thread ?? EMPTY_THREAD, r?.full ?? null, r?.truncated ?? false));
     }
   }
 
@@ -663,6 +687,7 @@ export async function fetchEmailsBatch(
         bodystructure: JSON.stringify(p.raw.bodystructure),
         headersRaw: p.raw.headersRaw,
         headersFull: p.raw.headersFull,
+        headersTruncated: p.raw.headersTruncated,
         threadInputs: JSON.stringify(p.raw.thread),
         preview: previewByUid.get(p.raw.uid) ?? null,
       });

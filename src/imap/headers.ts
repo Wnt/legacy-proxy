@@ -294,28 +294,30 @@ export interface ThreadInputs {
   references: string[] | null;
 }
 
-// Each list is kept up to this many characters: a sender can't make every
-// cached row and every listing carry megabytes of ids. A 300-message thread's
-// References is ~15 KB; threading only uses the first id.
-const MAX_THREAD_LIST_CHARS = 32 * 1024;
+// References (the `references` property) is kept up to this many characters,
+// so a sender can't make every cached row and every listing carry megabytes
+// of ids; a 300-message thread's References is ~15 KB. Of Message-ID and
+// In-Reply-To only the first id is used, for threading.
+const MAX_REFERENCES_CHARS = 16 * 1024;
 
-function capIds(ids: string[] | null): string[] | null {
+function capIds(ids: string[] | null, maxChars: number): string[] | null {
   if (!ids) return null;
   const out: string[] = [];
   let n = 0;
   for (const id of ids) {
     n += id.length + 2;
-    if (n > MAX_THREAD_LIST_CHARS) break;
+    if (n > maxChars) break;
     out.push(id);
   }
   return out.length ? out : null;
 }
 
 export function threadInputs(headers: ParsedHeader[]): ThreadInputs {
+  const first = (ids: string[] | null) => (ids?.length ? [ids[0]!] : null);
   return {
-    messageId: capIds(asMessageIds(headers, "Message-ID")),
-    inReplyTo: capIds(asMessageIds(headers, "In-Reply-To")),
-    references: capIds(asMessageIds(headers, "References")),
+    messageId: first(asMessageIds(headers, "Message-ID")),
+    inReplyTo: first(asMessageIds(headers, "In-Reply-To")),
+    references: capIds(asMessageIds(headers, "References"), MAX_REFERENCES_CHARS),
   };
 }
 

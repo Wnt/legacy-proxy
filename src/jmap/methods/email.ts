@@ -3,7 +3,7 @@ import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
 import { viewEmailState, type ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
-import { fetchEmailsBatch, type JmapEmail } from "../../imap/fetcher.js";
+import { fetchEmailsBatch, MAX_FULL_HEADER_BYTES_PER_CALL, type JmapEmail } from "../../imap/fetcher.js";
 import { withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
@@ -33,7 +33,12 @@ interface MailCtx {
   client: ImapFlow;
   store: Store;
   pool?: ImapPool;
+  /** The session's advertised maxObjectsInGet (config limits). */
+  maxObjectsInGet?: number;
 }
+
+// Same default as the config's MAX_OBJECTS_IN_GET.
+const DEFAULT_MAX_OBJECTS_IN_GET = 500;
 
 export interface EmailQueryArgs {
   accountId: string;
@@ -784,6 +789,11 @@ export async function emailGet(
   ctx: MailCtx,
 ): Promise<{ accountId: string; state: string; list: Record<string, unknown>[]; notFound: string[] }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  // RFC 8620 §5.1: more ids than the advertised maxObjectsInGet is an error,
+  // not a request to buffer however many messages a client names.
+  if (Array.isArray(args.ids) && args.ids.length > (ctx.maxObjectsInGet ?? DEFAULT_MAX_OBJECTS_IN_GET)) {
+    throw new JmapError("requestTooLarge", `at most ${ctx.maxObjectsInGet ?? DEFAULT_MAX_OBJECTS_IN_GET} ids per Email/get`);
+  }
   // The state these messages are read at; see viewState.
   const state = encodeEmailState({ uidvalidity: 0, modseq: viewState(ctx, ctx.client) });
   const list: JmapEmail[] = [];
@@ -805,6 +815,8 @@ export async function emailGet(
     maxBodyValueBytes: args.maxBodyValueBytes,
     wantsPreview,
     needsFullHeaders,
+    // One budget for the whole request, across its mailbox groups.
+    headerBudget: { remaining: MAX_FULL_HEADER_BYTES_PER_CALL },
   };
 
   // Group ids by mailbox so we can do one SELECT + one batched FETCH per
