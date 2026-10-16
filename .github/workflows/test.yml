@@ -20,11 +20,10 @@ jobs:
 
       - name: Build inputs are pinned
         # Every Dockerfile FROM/syntax image is tag@sha256:<digest> and every
-        # action is a full commit SHA (audit deploy-4); bump them together.
+        # action is a full commit SHA (audit deploy-4); see the script header.
         run: |
-          bad=$( { grep -nE '^[[:space:]]*FROM[[:space:]]|^# *syntax=' $(git ls-files '*Dockerfile*') | grep -vE '@sha256:[0-9a-f]{64}([[:space:]]|$)';
-                   grep -nE '^[[:space:]]*(-[[:space:]]*)?uses:' .github/workflows/*.yml | grep -vE 'uses:[[:space:]]*(\./|[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$))'; } || true)
-          if [ -n "$bad" ]; then echo "::error::Unpinned build inputs (pin images as tag@sha256:<digest>, actions to a full commit SHA):"; echo "$bad"; exit 1; fi
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+          python3 .github/scripts/check_pins.py
 
       - name: Set up Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -33,12 +32,15 @@ jobs:
           cache: npm
 
       - name: Install
-        # Compile better-sqlite3 from the lockfile-verified tarball against the
-        # installed Node's headers instead of downloading an unverified prebuild.
+        # No dependency lifecycle scripts (esbuild's and better-sqlite3's can
+        # fetch binaries outside the lockfile). esbuild runs from its locked
+        # platform package; better-sqlite3 is compiled from its locked tarball
+        # against the installed Node's headers.
         run: |
+          npm ci --ignore-scripts --no-audit --no-fund
           npm_config_build_from_source=better-sqlite3 \
           npm_config_nodedir="$(dirname "$(dirname "$(command -v node)")")" \
-            npm ci --no-audit --no-fund
+            npm rebuild better-sqlite3
 
       - name: Typecheck
         run: npm run lint

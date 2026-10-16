@@ -23,12 +23,10 @@ WORKDIR /app
 # superseded versions from its mirrors, which would break rebuilds.
 RUN apk add --no-cache python3 make g++ sqlite-dev
 COPY package.json package-lock.json tsconfig.json ./
-# better-sqlite3's install script would otherwise download an unverified
-# prebuilt binary from GitHub; compile it from the lockfile-verified npm
-# tarball against the base image's own Node headers instead.
-ENV npm_config_build_from_source=better-sqlite3 \
-    npm_config_nodedir=/usr/local
-RUN npm ci --no-audit --no-fund
+# This stage only runs tsc, so no dependency lifecycle script runs here
+# (esbuild's and better-sqlite3's install scripts can fetch binaries outside
+# the lockfile).
+RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY src ./src
 RUN npx tsc -p tsconfig.json
 
@@ -43,9 +41,13 @@ RUN apk add --no-cache sqlite-libs tini \
  && mkdir -p /data \
  && chown -R proxy:proxy /data
 COPY package.json package-lock.json ./
+# Lifecycle scripts are off; the one native module, better-sqlite3, is then
+# compiled from its lockfile-verified tarball against the base image's Node
+# headers, never from a prebuilt binary downloaded from GitHub.
 RUN apk add --no-cache --virtual .build python3 make g++ sqlite-dev \
+ && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
  && npm_config_build_from_source=better-sqlite3 npm_config_nodedir=/usr/local \
-    npm ci --omit=dev --no-audit --no-fund \
+    npm rebuild better-sqlite3 \
  && apk del .build \
  && npm cache clean --force
 COPY --from=build /app/dist ./dist
