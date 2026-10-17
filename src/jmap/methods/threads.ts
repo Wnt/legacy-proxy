@@ -205,6 +205,89 @@ async function syncMailboxScan(
   });
 }
 
+// Freshness of the email_cache thread rows, per account. Thread/get,
+// Thread/changes and collapseThreads read those rows directly (one thread, or
+// the ids at hand), so all they need is the incremental scan below; only the
+// noneInThreadHaveKeyword filter still wants the whole index with flags.
+interface RowSync {
+  expiresAt: number;
+  emailState: number;
+}
+const rowSync = new Map<number, RowSync>();
+// A state change (IDLE saw new mail, or we wrote) always re-syncs; without
+// one, rows are re-checked against LIST-STATUS at most this often -- the
+// staleness window listMailboxes and the search cache already accept.
+const ROW_SYNC_TTL_MS = 30_000;
+const rowSyncInflight = new Map<number, Promise<void>>();
+
+/** Forget every cached index and row freshness (tests, where account ids repeat across stores). */
+export function resetThreadCaches(): void {
+  indexCache.clear();
+  rowSync.clear();
+}
+
+/** Bring the account's thread rows up to date (incremental, cached, one scan at a time). */
+export async function syncThreadRows(ctx: ThreadCtx): Promise<void> {
+  const now = Date.now();
+  const curState = ctx.store.getState(ctx.account.id, "email");
+  const fresh = rowSync.get(ctx.account.id);
+  if (fresh && fresh.expiresAt > now && fresh.emailState === curState) return;
+  const running = rowSyncInflight.get(ctx.account.id) ?? inflight.get(ctx.account.id);
+  if (running) {
+    await running.catch(() => {});
+    return syncThreadRows(ctx);
+  }
+  const scan = (async () => {
+    const lease = ctx.pool ? await ctx.pool.acquire(ctx.account, "bulk") : null;
+    try {
+      await scanFolders(ctx, lease ? lease.client : ctx.client, false);
+      rowSync.set(ctx.account.id, { expiresAt: now + ROW_SYNC_TTL_MS, emailState: curState });
+    } finally {
+      lease?.release();
+    }
+  })();
+  rowSyncInflight.set(ctx.account.id, scan);
+  try {
+    await scan;
+  } finally {
+    rowSyncInflight.delete(ctx.account.id);
+  }
+}
+
+/** A thread's member email ids, oldest first (empty for an unknown thread). */
+export function threadMemberIds(store: Store, accountId: number, threadId: string): string[] {
+  return store.getThreadMembers(accountId, threadId).map((r) =>
+    encodeEmailId({ accountIdx: accountId, mailboxIdx: r.mailbox_id, uidvalidity: r.uidvalidity, uid: r.uid }),
+  );
+}
+
+/** threadId of each given email id that has one recorded; others are absent. */
+export function threadIdsOf(store: Store, accountId: number, emailIds: Iterable<string>): Map<string, string> {
+  const groups = new Map<string, { mailboxIdx: number; uidvalidity: number; byUid: Map<number, string> }>();
+  for (const id of emailIds) {
+    let p;
+    try {
+      p = decodeEmailId(id);
+    } catch {
+      continue;
+    }
+    if (p.accountIdx !== accountId) continue;
+    const key = `${p.mailboxIdx}:${p.uidvalidity}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { mailboxIdx: p.mailboxIdx, uidvalidity: p.uidvalidity, byUid: new Map() };
+      groups.set(key, g);
+    }
+    g.byUid.set(p.uid, id);
+  }
+  const out = new Map<string, string>();
+  for (const g of groups.values()) {
+    const tids = store.getThreadIdsByUid(accountId, g.mailboxIdx, g.uidvalidity, [...g.byUid.keys()]);
+    for (const [uid, tid] of tids) out.set(g.byUid.get(uid)!, tid);
+  }
+  return out;
+}
+
 export async function buildThreadIndex(
   ctx: ThreadCtx,
   opts: { withFlags?: boolean } = {},
@@ -224,7 +307,7 @@ export async function buildThreadIndex(
 
   // One build per account at a time: a request that arrives mid-build waits
   // for it rather than walking the same folders again on another connection.
-  const running = inflight.get(ctx.account.id);
+  const running = inflight.get(ctx.account.id) ?? rowSyncInflight.get(ctx.account.id);
   if (running) {
     await running.catch(() => {});
     return buildThreadIndex(ctx, opts);
@@ -236,6 +319,64 @@ export async function buildThreadIndex(
   } finally {
     inflight.delete(ctx.account.id);
   }
+}
+
+// Walk the folders: bring each moved folder's rows up to date, and with
+// `wantFlags` read every folder's flags. Runs on `client`, which the caller
+// holds for the whole walk.
+async function scanFolders(ctx: ThreadCtx, client: ImapFlow, wantFlags: boolean): Promise<Map<string, Set<string>>> {
+  // A fresh LIST reports every folder's UIDVALIDITY, UIDNEXT and count in one
+  // round trip (LIST-STATUS); only folders where those moved get SELECTed.
+  // Before, each build SELECTed every non-empty folder, and on Gmail, where
+  // every label is a folder, that alone took tens of seconds.
+  const all = await listMailboxes(client, ctx.account, ctx.store, { force: true });
+  const rows = ctx.store
+    .prep(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
+    .all(ctx.account.id) as { id: number; name: string; uidvalidity: number }[];
+  const rowById = new Map(rows.map((r) => [r.id, r] as const));
+
+  const flagsByEmail = new Map<string, Set<string>>();
+  for (const m of all) {
+    const mailboxIdx = decodeMailboxId(m.id).mailboxIdx;
+    const row = rowById.get(mailboxIdx);
+    if (!row) continue;
+    const scan = ctx.store.getMailboxScan(ctx.account.id, mailboxIdx);
+    if (m.totalEmails === 0 && (scan?.messages ?? 0) === 0) continue;
+    // Flags are mutable and not in the scan, so a flags build still reads them.
+    const live = liveMailboxStatus(ctx.account.id, row.name);
+    if (!wantFlags && live && scan && sameAsLastScan(live, scan)) continue;
+    try {
+      await withMailbox(client, row.name, async () => {
+        await syncMailboxScan(client, ctx.account, mailboxIdx, ctx.store);
+        if (wantFlags) {
+          const mb = client.mailbox && typeof client.mailbox === "object" ? client.mailbox : null;
+          const uidvalidity = Number(
+            (mb as { uidValidity?: number | bigint } | null)?.uidValidity ?? row.uidvalidity,
+          );
+          const exists = Number((mb as { exists?: number } | null)?.exists ?? 0);
+          if (exists > 0) {
+            for await (const msg of client.fetch("1:*", { uid: true, flags: true }, { uid: true })) {
+              if (msg.uid == null) continue;
+              const eid = encodeEmailId({
+                accountIdx: ctx.account.id,
+                mailboxIdx,
+                uidvalidity,
+                uid: msg.uid,
+              });
+              flagsByEmail.set(eid, msg.flags ? new Set(msg.flags) : new Set());
+            }
+          }
+        }
+      });
+    } catch (e) {
+      // Skip folders we can't open; the index just won't include them.
+      log.warn(
+        { mailbox: row.name, err: (e as Error).message },
+        "thread scan: skipping mailbox",
+      );
+    }
+  }
+  return flagsByEmail;
 }
 
 async function rebuildThreadIndex(
@@ -250,58 +391,8 @@ async function rebuildThreadIndex(
   const lease = ctx.pool ? await ctx.pool.acquire(ctx.account, "bulk") : null;
   const client = lease ? lease.client : ctx.client;
   try {
-
-    // A fresh LIST reports every folder's UIDVALIDITY, UIDNEXT and count in one
-    // round trip (LIST-STATUS); only folders where those moved get SELECTed.
-    // Before, each build SELECTed every non-empty folder, and on Gmail, where
-    // every label is a folder, that alone took tens of seconds.
-    const all = await listMailboxes(client, ctx.account, ctx.store, { force: true });
-    const rows = ctx.store
-      .prep(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
-      .all(ctx.account.id) as { id: number; name: string; uidvalidity: number }[];
-    const rowById = new Map(rows.map((r) => [r.id, r] as const));
-
-    const flagsByEmail = new Map<string, Set<string>>();
-    for (const m of all) {
-      const mailboxIdx = decodeMailboxId(m.id).mailboxIdx;
-      const row = rowById.get(mailboxIdx);
-      if (!row) continue;
-      const scan = ctx.store.getMailboxScan(ctx.account.id, mailboxIdx);
-      if (m.totalEmails === 0 && (scan?.messages ?? 0) === 0) continue;
-      // Flags are mutable and not in the scan, so a flags build still reads them.
-      const live = liveMailboxStatus(ctx.account.id, row.name);
-      if (!wantFlags && live && scan && sameAsLastScan(live, scan)) continue;
-      try {
-        await withMailbox(client, row.name, async () => {
-          await syncMailboxScan(client, ctx.account, mailboxIdx, ctx.store);
-          if (wantFlags) {
-            const mb = client.mailbox && typeof client.mailbox === "object" ? client.mailbox : null;
-            const uidvalidity = Number(
-              (mb as { uidValidity?: number | bigint } | null)?.uidValidity ?? row.uidvalidity,
-            );
-            const exists = Number((mb as { exists?: number } | null)?.exists ?? 0);
-            if (exists > 0) {
-              for await (const msg of client.fetch("1:*", { uid: true, flags: true }, { uid: true })) {
-                if (msg.uid == null) continue;
-                const eid = encodeEmailId({
-                  accountIdx: ctx.account.id,
-                  mailboxIdx,
-                  uidvalidity,
-                  uid: msg.uid,
-                });
-                flagsByEmail.set(eid, msg.flags ? new Set(msg.flags) : new Set());
-              }
-            }
-          }
-        });
-      } catch (e) {
-        // Skip folders we can't open; the index just won't include them.
-        log.warn(
-          { mailbox: row.name, err: (e as Error).message },
-          "thread scan: skipping mailbox",
-        );
-      }
-    }
+    const flagsByEmail = await scanFolders(ctx, client, wantFlags);
+    rowSync.set(ctx.account.id, { expiresAt: now + ROW_SYNC_TTL_MS, emailState: curState });
 
     const index: ThreadIndex = {
       members: new Map(),
@@ -345,10 +436,10 @@ export async function threadGet(
   const list: ThreadJson[] = [];
   const notFound: string[] = [];
   const ids = args.ids ?? [];
-  // Build (or reuse cached) thread membership map across the account.
-  const idx = await buildThreadIndex(ctx);
+  // Bring the thread rows up to date, then read just the threads asked for.
+  await syncThreadRows(ctx);
   for (const id of ids) {
-    const members = idx.members.get(id);
+    const members = typeof id === "string" ? threadMemberIds(ctx.store, ctx.account.id, id) : [];
     if (members && members.length > 0) {
       list.push({ id, emailIds: members });
       continue;
@@ -406,7 +497,8 @@ export async function threadChanges(
   const entries = ctx.store.entriesSince(ctx.account.id, "email", decoded, currentNumeric);
   if (!entries) throw cannotCalculateChanges();
 
-  const idx = await buildThreadIndex(ctx);
+  await syncThreadRows(ctx);
+  const threadOf = threadIdsOf(ctx.store, ctx.account.id, entries.map((e) => e.id));
   const created = new Set<string>();
   const updated = new Set<string>();
   const destroyed = new Set<string>();
@@ -417,7 +509,7 @@ export async function threadChanges(
   // in this window; otherwise it's updated.
   const threadsTouched = new Map<string, { hadCreate: boolean; hadDestroy: boolean }>();
   for (const e of entries) {
-    let tid = idx.byEmail.get(e.id);
+    let tid = threadOf.get(e.id);
     if (!tid) {
       // Email destroyed and no longer in the index — fall back to using its
       // own id as the thread id (matches the degenerate single-message
@@ -430,7 +522,7 @@ export async function threadChanges(
     threadsTouched.set(tid, t);
   }
   for (const [tid, t] of threadsTouched) {
-    const liveCount = idx.members.get(tid)?.length ?? 0;
+    const liveCount = ctx.store.getThreadMembers(ctx.account.id, tid).length;
     if (liveCount === 0 && t.hadDestroy) destroyed.add(tid);
     else if (t.hadCreate && liveCount > 0) {
       // If we logged a `created` and the thread now exists, treat it as a

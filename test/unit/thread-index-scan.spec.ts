@@ -8,7 +8,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ImapFlow } from "imapflow";
 import { Store } from "../../src/state/store.js";
-import { buildThreadIndex } from "../../src/jmap/methods/threads.js";
+import { vi } from "vitest";
+import { buildThreadIndex, resetThreadCaches, syncThreadRows, threadGet, threadIdsOf } from "../../src/jmap/methods/threads.js";
+import { encodeEmailId } from "../../src/mapping/ids.js";
 
 let dir: string;
 let store: Store;
@@ -16,6 +18,7 @@ let store: Store;
 beforeEach(() => {
   dir = mkdtempSync(path.join(tmpdir(), "threadscan-"));
   store = new Store(dir);
+  resetThreadCaches();
 });
 
 afterEach(() => {
@@ -80,5 +83,41 @@ describe("thread index scan", () => {
     await Promise.all([buildThreadIndex(ctx), buildThreadIndex(ctx), buildThreadIndex(ctx)]);
     expect(log.lists).toBe(1);
     expect(log.selects).toEqual(["INBOX"]);
+  });
+
+  it("answers Thread/get from the requested threads' rows, without loading the whole index", async () => {
+    const { client, log } = fakeServer({
+      INBOX: { messages: 2, uidNext: 3, uidValidity: 1n },
+      Sent: { messages: 1, uidNext: 6, uidValidity: 1n },
+    });
+    const account = store.upsertAccount({ slug: "c", kind: "generic", host: "h", username: "u", vault: Buffer.from("v") });
+    const ctx = { account, client, store };
+    await syncThreadRows(ctx);
+    const mbox = new Map((store.db.prepare("SELECT id, name FROM mailbox WHERE account_id = ?").all(account.id) as { id: number; name: string }[]).map((r) => [r.name, r.id]));
+    const inbox = mbox.get("INBOX")!, sent = mbox.get("Sent")!;
+    store.upsertEmailCacheRows([
+      { accountId: account.id, mailboxId: inbox, uidvalidity: 1, uid: 1, threadId: "T1", internaldate: 100 },
+      { accountId: account.id, mailboxId: sent, uidvalidity: 1, uid: 5, threadId: "T1", internaldate: 50 },
+      { accountId: account.id, mailboxId: inbox, uidvalidity: 1, uid: 2, threadId: "T2", internaldate: 200 },
+    ]);
+    const id = (mailboxIdx: number, uid: number) => encodeEmailId({ accountIdx: account.id, mailboxIdx, uidvalidity: 1, uid });
+    const full = vi.spyOn(store, "getThreadIndexRows");
+    const r = await threadGet({ accountId: String(account.id), ids: ["T1", "T2", "nope"] }, ctx);
+    expect(r.list).toEqual([
+      { id: "T1", emailIds: [id(sent, 5), id(inbox, 1)] },
+      { id: "T2", emailIds: [id(inbox, 2)] },
+    ]);
+    expect(r.notFound).toEqual(["nope"]);
+    expect(full).not.toHaveBeenCalled();
+    // Fresh rows are reused until the state moves.
+    expect(log.lists).toBe(1);
+    await threadGet({ accountId: String(account.id), ids: ["T1"] }, ctx);
+    expect(log.lists).toBe(1);
+    store.bumpState(account.id, "email");
+    await threadGet({ accountId: String(account.id), ids: ["T1"] }, ctx);
+    expect(log.lists).toBe(2);
+
+    const tids = threadIdsOf(store, account.id, [id(inbox, 1), id(inbox, 2), id(sent, 5), id(sent, 9), "garbage"]);
+    expect(Object.fromEntries(tids)).toEqual({ [id(inbox, 1)]: "T1", [id(inbox, 2)]: "T2", [id(sent, 5)]: "T1" });
   });
 });

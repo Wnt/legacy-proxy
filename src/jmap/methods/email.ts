@@ -24,7 +24,7 @@ import { listMailboxes, refreshMailboxCounts } from "./mailbox.js";
 import { log } from "../../util/log.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import { headersToEmailHeaders, projectHeaderProp } from "../../imap/headers.js";
-import { buildThreadIndex } from "./threads.js";
+import { buildThreadIndex, syncThreadRows, threadIdsOf } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
 import {
   buildRfc822,
@@ -184,6 +184,10 @@ function invalidateSearchCacheForAccount(accountId: number): void {
   for (const k of [...searchCache.keys()]) {
     if (k.startsWith(prefix)) searchCache.delete(k);
   }
+  for (const k of [...folderSearchCache.keys()]) {
+    if (k.startsWith(prefix)) folderSearchCache.delete(k);
+  }
+  folderSnapshots.delete(accountId);
 }
 
 // The account email state that results read on `client` include: the state
@@ -326,11 +330,14 @@ export async function emailQuery(
   }
 
   if (args.collapseThreads === true) {
-    const indexed = await buildThreadIndex(ctx);
+    // Only the matched ids' threads matter: look those up, rather than load
+    // the whole account's thread index (seconds on a 100k-message account).
+    await syncThreadRows(ctx);
+    const threadOf = threadIdsOf(ctx.store, ctx.account.id, orderedIds);
     const seen = new Set<string>();
     const dedup: string[] = [];
     for (const id of orderedIds) {
-      const tid = indexed.byEmail.get(id) ?? id;
+      const tid = threadOf.get(id) ?? id;
       if (seen.has(tid)) continue;
       seen.add(tid);
       dedup.push(id);
@@ -656,6 +663,94 @@ async function emailQuerySingleMailboxFull(
 // connection is picked up immediately rather than sitting idle.
 const ACCOUNT_SCAN_CONCURRENCY = 3;
 
+// Account-wide queries (tag counts, "all folders" searches) used to SELECT and
+// SEARCH every folder whenever the account's email state had moved, and any
+// write -- opening a message sets $seen -- moves it. A client that refreshes a
+// handful of tag counts after each open then kept every connection busy for
+// tens of seconds. Each folder's SEARCH result is now kept with the folder's
+// HIGHESTMODSEQ, UIDNEXT and message count from LIST-STATUS (RFC 7162: any
+// flag change, arrival or expunge in the folder raises HIGHESTMODSEQ), and
+// reused for as long as those are unchanged, so only folders that changed are
+// searched again. One LIST-STATUS serves a burst of queries.
+interface FolderStatus {
+  uidValidity: number;
+  uidNext: number;
+  messages: number;
+  modseq: string;
+}
+interface FolderSnapshot {
+  emailState: number;
+  at: number;
+  byPath: Map<string, FolderStatus>;
+}
+const folderSnapshots = new Map<number, FolderSnapshot>();
+const folderSnapshotInflight = new Map<number, Promise<FolderSnapshot>>();
+// How long one LIST-STATUS answers for, while the account's state stays put.
+const FOLDER_SNAPSHOT_TTL_MS = 5_000;
+
+interface FolderSearchEntry extends FolderStatus {
+  uids: number[];
+}
+const folderSearchCache = new Map<string, FolderSearchEntry>();
+const FOLDER_SEARCH_CACHE_MAX = 4096;
+
+async function folderSnapshot(ctx: MailCtx, emailState: number): Promise<FolderSnapshot | null> {
+  const id = ctx.account.id;
+  const cur = folderSnapshots.get(id);
+  if (cur && cur.emailState === emailState && Date.now() - cur.at < FOLDER_SNAPSHOT_TTL_MS) return cur;
+  let running = folderSnapshotInflight.get(id);
+  if (!running) {
+    running = (async () => {
+      const at = Date.now();
+      const list = await ctx.client.list({
+        statusQuery: { messages: true, uidNext: true, uidValidity: true, highestModseq: true },
+      });
+      const byPath = new Map<string, FolderStatus>();
+      for (const it of list) {
+        const st = it.status as
+          | { messages?: number; uidNext?: number; uidValidity?: number | bigint; highestModseq?: number | bigint }
+          | undefined;
+        if (st?.uidNext == null || st.uidValidity == null || st.messages == null || st.highestModseq == null) continue;
+        byPath.set(it.path, {
+          uidValidity: Number(st.uidValidity),
+          uidNext: Number(st.uidNext),
+          messages: st.messages,
+          modseq: String(st.highestModseq),
+        });
+      }
+      const snap = { emailState, at, byPath };
+      folderSnapshots.set(id, snap);
+      return snap;
+    })();
+    folderSnapshotInflight.set(id, running);
+    running.finally(() => folderSnapshotInflight.delete(id)).catch(() => {});
+  }
+  try {
+    const snap = await running;
+    // A snapshot read for an older state is no good to a newer caller.
+    return snap.emailState === emailState ? snap : null;
+  } catch (e) {
+    log.warn({ err: (e as Error).message }, "account-wide Email/query: LIST-STATUS failed; searching every folder");
+    return null;
+  }
+}
+
+function sameFolderStatus(a: FolderStatus, b: FolderStatus): boolean {
+  return a.uidValidity === b.uidValidity && a.uidNext === b.uidNext && a.messages === b.messages && a.modseq === b.modseq;
+}
+
+function putFolderSearch(key: string, entry: FolderSearchEntry): void {
+  folderSearchCache.delete(key);
+  folderSearchCache.set(key, entry);
+  if (folderSearchCache.size <= FOLDER_SEARCH_CACHE_MAX) return;
+  const drop = folderSearchCache.size - FOLDER_SEARCH_CACHE_MAX;
+  let i = 0;
+  for (const k of folderSearchCache.keys()) {
+    if (i++ >= drop) break;
+    folderSearchCache.delete(k);
+  }
+}
+
 async function emailQueryAccountWideFull(
   ctx: MailCtx,
   filter: Filter,
@@ -696,6 +791,14 @@ async function emailQueryAccountWideFull(
   // Each folder's hits are collected separately and concatenated in
   // listMailboxes order, so the merge below sees exactly the input it saw
   // when this ran serially. The result is identical, only sooner.
+  //
+  // Per-folder STATUS, for reusing SEARCH results of folders that did not
+  // change. Without it (LIST failed, or a server without CONDSTORE) every
+  // folder is searched, as before.
+  const snapshot = await folderSnapshot(ctx, emailState);
+  const filterHash = stableHash(filter);
+  const folderKey = (idx: number, uidvalidity: number) => `${ctx.account.id}|${idx}|${uidvalidity}|${filterHash}`;
+
   const targets: Array<{ idx: number; row: MboxRow }> = [];
   for (const m of all) {
     const idx = decodeMailboxId(m.id).mailboxIdx;
@@ -703,11 +806,32 @@ async function emailQueryAccountWideFull(
     // An empty folder can't contribute matches; skip the SELECT + SEARCH
     // round trips. The count comes from the cached LIST STATUS (<=30s stale,
     // the same window the search cache already tolerates).
-    if (m.totalEmails === 0) continue;
     const row = rowById.get(idx);
     if (!row) continue;
+    // The fresh STATUS when there is one, else the cached LIST's count.
+    if ((snapshot?.byPath.get(row.name)?.messages ?? m.totalEmails) === 0) continue;
     targets.push({ idx, row });
   }
+
+  // A folder whose STATUS still matches its cached SEARCH needs no
+  // connection: the hits come from that result and the cached dates. Null
+  // when it has to be searched (or a date has to be fetched).
+  const cachedFolderHits = (idx: number, row: MboxRow): SortableHit[] | null => {
+    if (needsFetch || !snapshot) return null;
+    const live = snapshot.byPath.get(row.name);
+    if (!live) return null;
+    const hit = folderSearchCache.get(folderKey(idx, live.uidValidity));
+    if (!hit || !sameFolderStatus(hit, live)) return null;
+    if (hit.uids.length === 0) return [];
+    const rows = ctx.store.getEmailCacheRows(ctx.account.id, idx, live.uidValidity, hit.uids);
+    const found: SortableHit[] = [];
+    for (const uid of hit.uids) {
+      const r = rows.get(uid);
+      if (!r || !(r.internaldate > 0)) return null;
+      found.push({ mailboxIdx: idx, uidvalidity: live.uidValidity, uid, receivedAt: r.internaldate });
+    }
+    return found;
+  };
 
   const scanFolder = async (idx: number, row: MboxRow, client: ImapFlow): Promise<SortableHit[]> => {
     const found: SortableHit[] = [];
@@ -726,6 +850,13 @@ async function emailQueryAccountWideFull(
       if (cached && cached.modseq === modseq && cached.emailState === emailState && cached.expiresAt > Date.now()) {
         uids = cached.uids;
       }
+      // The folder STATUS read before this SEARCH; the result is filed under
+      // it, so a change made in between only causes a needless re-search.
+      const live = snapshot?.byPath.get(row.name);
+      if (!uids && live && live.uidValidity === uidvalidity) {
+        const prev = folderSearchCache.get(folderKey(idx, uidvalidity));
+        if (prev && sameFolderStatus(prev, live)) uids = prev.uids;
+      }
       if (!uids) {
         const searchResult = await client.search(imapFilter, { uid: true });
         uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
@@ -736,6 +867,7 @@ async function emailQueryAccountWideFull(
           expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
         });
         pruneSearchCache();
+        if (live && live.uidValidity === uidvalidity) putFolderSearch(folderKey(idx, uidvalidity), { ...live, uids });
       }
       if (uids.length === 0) return;
 
@@ -786,6 +918,8 @@ async function emailQueryAccountWideFull(
   };
 
   const perFolder = await mapWithConcurrency(targets, ACCOUNT_SCAN_CONCURRENCY, async (t) => {
+    const cachedHits = cachedFolderHits(t.idx, t.row);
+    if (cachedHits) return cachedHits;
     try {
       // Unit-test contexts are built without a pool; fall back to the
       // request's own connection, which reproduces the old serial walk.

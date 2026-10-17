@@ -801,6 +801,34 @@ export class Store {
       .all(accountId) as ThreadIndexRow[];
   }
 
+  // One thread's members, in the same order as getThreadIndexRows. Uses
+  // email_cache_thread_idx, so its cost is the thread's size, not the
+  // account's: Thread/get no longer loads every row of a 100k-message account.
+  getThreadMembers(accountId: number, threadId: string): ThreadIndexRow[] {
+    return this.prep(
+        `SELECT mailbox_id, uidvalidity, uid, thread_id, internaldate
+         FROM email_cache WHERE account_id = ? AND thread_id = ?
+         ORDER BY internaldate ASC, uid ASC`,
+      )
+      .all(accountId, threadId) as ThreadIndexRow[];
+  }
+
+  /** threadId per uid for the given messages of one folder epoch (uids without one are absent). */
+  getThreadIdsByUid(accountId: number, mailboxId: number, uidvalidity: number, uids: number[]): Map<number, string> {
+    const out = new Map<number, string>();
+    for (let i = 0; i < uids.length; i += Store.IN_CHUNK) {
+      const chunk = uids.slice(i, i + Store.IN_CHUNK);
+      const rows = this.prep(
+          `SELECT uid, thread_id FROM email_cache
+           WHERE account_id = ? AND mailbox_id = ? AND uidvalidity = ? AND thread_id IS NOT NULL
+           AND uid IN (${chunk.map(() => "?").join(",")})`,
+        )
+        .all(accountId, mailboxId, uidvalidity, ...chunk) as { uid: number; thread_id: string }[];
+      for (const r of rows) out.set(r.uid, r.thread_id);
+    }
+    return out;
+  }
+
   getMailboxScan(accountId: number, mailboxId: number): MailboxScanRow | undefined {
     return this.prep(`SELECT * FROM mailbox_scan WHERE account_id = ? AND mailbox_id = ?`)
       .get(accountId, mailboxId) as MailboxScanRow | undefined;
