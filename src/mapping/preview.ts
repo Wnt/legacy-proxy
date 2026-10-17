@@ -220,11 +220,11 @@ function isSelector(text: string): boolean {
   return tokens.length > 0 && tokens.every(isSelectorToken);
 }
 
-function isDeclarations(block: string): boolean {
+function isDeclarations(block: string, knownOnly = true): boolean {
   const items = block.split(";").map((d) => d.trim()).filter(Boolean);
   return items.length > 0 && items.every((d) => {
     const m = /^([-a-z]+)\s*:\s*\S/i.exec(d);
-    return m !== null && CSS_PROPERTY.test(m[1]!);
+    return m !== null && (!knownOnly || CSS_PROPERTY.test(m[1]!));
   });
 }
 
@@ -255,7 +255,8 @@ function matchBrace(text: string, open: number): number {
  * the rest of the text.
  */
 export function stripCssRules(text: string): string {
-  let out = text;
+  // `@import url(…);` has no block.
+  let out = text.replace(/@import\s+(?:url\([^)]*\)|"[^"]*"|'[^']*')[^;{}]*;?/gi, " ");
   for (let from = 0, guard = 0; guard < 500; guard++) {
     const open = out.indexOf("{", from);
     if (open < 0) break;
@@ -265,13 +266,13 @@ export function stripCssRules(text: string): string {
     const before = out.slice(Math.max(0, open - 300), open);
     const at = /@(?:media|supports|font-face|page|keyframes|-webkit-keyframes|document)\b[^{}@]*$/i.exec(before);
     let start = -1;
-    const isRule = close < 0 ? startsWithDeclaration(block) : isDeclarations(block);
     if (at) {
       const ok = close < 0 || (/^@(?:font-face|page)/i.test(at[0]) ? isDeclarations(block) : isRuleList(block));
       if (ok) start = open - (before.length - at.index);
-    } else if (isRule) {
+    } else {
+      // The selector: the selector tokens right before the brace.
       const tokens = before.split(/(\s+)/);
-      let taken = 0;
+      const taken: string[] = [];
       let consumed = 0;
       for (let i = tokens.length - 1; i >= 0; i--) {
         const t = tokens[i]!;
@@ -279,14 +280,16 @@ export function stripCssRules(text: string): string {
           consumed += t.length;
           continue;
         }
-        if (isSelectorToken(t)) {
-          consumed += t.length;
-          taken++;
-          continue;
-        }
-        break;
+        if (!isSelectorToken(t)) break;
+        consumed += t.length;
+        taken.push(t);
       }
-      if (taken > 0) start = open - consumed;
+      // Known properties make a rule of any selector; with a selector that
+      // is unmistakably one ("table, td", "td.x", "#a p"), any property does.
+      const strongSelector = taken.length >= 2 || taken.some((t) => /[.#:,[]/.test(t));
+      const known = close < 0 ? startsWithDeclaration(block) : isDeclarations(block);
+      const generic = close < 0 ? /^\s*[-a-z]+\s*:/i.test(block) : isDeclarations(block, false);
+      if (taken.length > 0 && (known || (strongSelector && generic))) start = open - consumed;
     }
     if (start < 0) {
       from = open + 1;

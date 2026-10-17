@@ -107,6 +107,12 @@ describe("plainPreview", () => {
     expect(plainPreview(".btn { color: red; ")).toBe("");
   });
 
+  it("drops a rule with an unknown property when the selector is unmistakable, and @import", () => {
+    expect(plainPreview("Newsletter for October table, td {family: Arial, sans-serif;} Read more")).toBe("Newsletter for October Read more");
+    expect(plainPreview("Hello @import url(https://fonts.example.com/css?family=Roboto); there")).toBe("Hello there");
+    expect(plainPreview("Note p {foo: bar} stays")).toBe("Note p {foo: bar} stays");
+  });
+
   it("recognises the selectors email style sheets use", () => {
     expect(plainPreview("#outlook a { padding:0; } .ReadMsgBody { width:100%; } a[x-apple-data-detectors] { color:inherit !important; } [data-ogsc] .dark, u + .body .x { color:#fff } *[x-apple-data-detectors] { color:inherit } td:hover, a::after { display:none } Text")).toBe("Text");
   });
@@ -230,21 +236,21 @@ describe("fetchEmailsBatch preview", () => {
   });
 });
 
-describe("cache upgrade to v4", () => {
+describe("cache upgrade to v5", () => {
   it("forgets cached previews, keeps the rest of the row, and moves the Email state", async () => {
     store.upsertEmailCacheRows([{ accountId: 1, mailboxId: 2, uidvalidity: 1, uid: 7, threadId: "T1", internaldate: 5,
       threadInputs: JSON.stringify({ messageId: null, inReplyTo: null, references: null }),
       envelope: JSON.stringify({ subject: "s" }), bodystructure: JSON.stringify(leaf("1", HTML)),
       preview: "td{color:red} .x{margin:0}" }]);
     const before = store.getState(1, "email");
-    store.db.pragma("user_version = 3");
+    store.db.pragma("user_version = 4");
     store.db.close();
     store = new Store(dir);
     const row = store.prep(`SELECT preview, thread_id, envelope FROM email_cache WHERE uid = 7`).get() as Record<string, unknown>;
     expect(row).toMatchObject({ preview: null, thread_id: "T1" });
     expect(row.envelope).toBeTruthy();
     expect(store.getState(1, "email")).toBeGreaterThan(before);
-    expect(store.db.pragma("user_version", { simple: true })).toBe(4);
+    expect(store.db.pragma("user_version", { simple: true })).toBe(5);
     // The next read computes the preview again and caches it.
     const got = await fetchEmailsBatch(server(leaf("1", HTML), { "1": HTML }), account, mailbox, [7], {}, store);
     expect(got.get(7)!.preview).toBe(htmlPreview(NEWSLETTER));

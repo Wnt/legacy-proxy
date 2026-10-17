@@ -270,7 +270,8 @@ export class Store {
     // earlier ones could start with a style sheet or markup.
     // v4: CSS rules anywhere in a preview, and tags and entity references
     // left in plain-text parts, are removed too.
-    for (const v of [3, 4]) {
+    // v5: rules with an unmistakable selector and @import are removed too.
+    for (const v of [3, 4, 5]) {
       if ((this.db.pragma("user_version", { simple: true }) as number) < v) {
         this.db.transaction(() => {
           this.forgetPreviews();
