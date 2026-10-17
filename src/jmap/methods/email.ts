@@ -175,22 +175,29 @@ function pruneSearchCache(): void {
   }
 }
 
-// Drop every cache entry for an account. Called after we mutate emails
+// Drop the account's cached search results. Called after we mutate emails
 // (Email/set, Email/import, Email/copy) — the next Email/query needs to see
 // the new state, and imapflow's cached mailbox.highestModseq isn't always
 // advanced on the same connection that did the APPEND, so the modseq guard
 // alone can serve a stale answer.
-function invalidateSearchCacheForAccount(accountId: number, store?: Store): void {
+// With `mailboxes` (the folders the write touched), the per-folder results of
+// account-wide queries are dropped for those folders only: the others did not
+// change, and their results are still checked against a fresh LIST-STATUS
+// (the snapshot is dropped too). Dropping every folder made each message open
+// ($seen) cost a full re-search of every folder on the next tag count.
+function invalidateSearchCacheForAccount(accountId: number, store?: Store, mailboxes?: Iterable<number>): void {
   const prefix = `${accountId}|`;
   for (const k of [...searchCache.keys()]) {
     if (k.startsWith(prefix)) searchCache.delete(k);
   }
+  const only = mailboxes ? [...mailboxes] : null;
+  const folderPrefixes = only && only.length > 0 ? only.map((idx) => `${accountId}|${idx}|`) : [prefix];
   for (const k of [...folderSearchCache.keys()]) {
-    if (k.startsWith(prefix)) folderSearchCache.delete(k);
+    if (folderPrefixes.some((p) => k.startsWith(p))) folderSearchCache.delete(k);
   }
   folderSnapshots.delete(accountId);
   try {
-    store?.deleteFolderSearches(accountId);
+    store?.deleteFolderSearches(accountId, only && only.length > 0 ? only : undefined);
   } catch (e) {
     log.warn({ err: (e as Error).message }, "folder search cache purge failed");
   }
@@ -1326,7 +1333,7 @@ export async function emailSet(
     Object.keys(updated).length > 0 ||
     destroyed.length > 0;
   if (mutated) {
-    invalidateSearchCacheForAccount(ctx.account.id, ctx.store);
+    invalidateSearchCacheForAccount(ctx.account.id, ctx.store, touchedMailboxes);
     ctx.store.recordChanges(ctx.account.id, "email", {
       created: Object.entries(created).map(([, r]) => (r as { id: string }).id),
       updated: Object.keys(updated),

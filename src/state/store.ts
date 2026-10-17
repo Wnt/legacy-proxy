@@ -589,8 +589,13 @@ export class Store {
     txn();
   }
 
-  deleteFolderSearches(accountId: number): void {
-    this.prep(`DELETE FROM folder_search_cache WHERE account_id = ?`).run(accountId);
+  deleteFolderSearches(accountId: number, mailboxIds?: number[]): void {
+    if (!mailboxIds) {
+      this.prep(`DELETE FROM folder_search_cache WHERE account_id = ?`).run(accountId);
+      return;
+    }
+    const stmt = this.prep(`DELETE FROM folder_search_cache WHERE account_id = ? AND mailbox_id = ?`);
+    for (const id of mailboxIds) stmt.run(accountId, id);
   }
 
   putUpload(p: { id: string; accountId: number; ctype: string; body: Buffer }): void {
