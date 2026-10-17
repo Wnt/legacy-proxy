@@ -4,6 +4,7 @@ import type { FetchMessageObject, ImapFlow } from "imapflow";
 // @ts-expect-error no declaration file
 import libqp from "libqp";
 import { selectBodies, structureToBodyParts, type EmailBodyPart } from "../mapping/structure.js";
+import { buildPreview } from "../mapping/preview.js";
 import { flagsToKeywords } from "../mapping/flags.js";
 import { encodeBlobId, encodeEmailId, encodeMailboxId } from "../mapping/ids.js";
 import {
@@ -249,23 +250,6 @@ function decodeTransferEncoding(buf: Buffer, encoding: string | null): Buffer {
   return buf;
 }
 
-function htmlToPlain(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<\/(p|div|br|h[1-6]|li|tr)>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/[\t ]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
 function addr(list: { name?: string | null; address?: string | null }[] | null | undefined) {
   if (!list || list.length === 0) return null;
   return list
@@ -273,14 +257,28 @@ function addr(list: { name?: string | null; address?: string | null }[] | null |
     .map((a) => ({ name: a.name?.trim() || null, email: a.address! }));
 }
 
-// Bytes of body text to fetch for the preview snippet. JMAP previews cap at
-// 256 chars; pulling a few KB tolerates multi-byte charsets, quoted-printable
-// expansion, and HTML markup overhead before the htmlToPlain step.
-const PREVIEW_FETCH_BYTES = 4096;
+// Bytes of a body part to fetch for the preview. JMAP previews cap at 256
+// characters. A plain-text part reaches them within a few KB, whatever the
+// charset or transfer encoding. An HTML part often does not: bulk mail puts
+// tens of KB of <style> blocks and layout before its first visible word, so
+// a short prefix would end inside a style sheet. Each Email/get spends at
+// most PREVIEW_FETCH_BUDGET on preview fetches; messages past it get no
+// preview in that response (and none is cached, so a later read computes it).
+const PREVIEW_TEXT_FETCH_BYTES = 8 * 1024;
+const PREVIEW_HTML_FETCH_BYTES = 128 * 1024;
+const PREVIEW_FETCH_BUDGET = 16 * 1024 * 1024;
 
-function buildPreview(text: string, isHtml: boolean): string {
-  const plain = isHtml ? htmlToPlain(text) : text;
-  return plain.replace(/\s+/g, " ").trim().slice(0, 256);
+// The parts a preview is made from: the first text/plain part (or other
+// non-HTML text part) of the text body, else the first HTML part. Chosen by
+// type, not by list, since an HTML-only message may list its HTML part in
+// textBody as well (RFC 8621 §4.1.4).
+function previewParts(sel: ReturnType<typeof selectBodies>): { text: EmailBodyPart | null; html: EmailBodyPart | null } {
+  const text = sel.textBody.find((b) => b.partId && b.type !== "text/html") ?? null;
+  const html =
+    sel.htmlBody.find((b) => b.partId && b.type === "text/html") ??
+    sel.textBody.find((b) => b.partId && b.type === "text/html") ??
+    null;
+  return { text, html };
 }
 
 // Envelope as imapflow parses it. When rehydrated from the cache the Date
@@ -676,65 +674,81 @@ async function fetchBodyValuesBatched(
 }
 
 // Fetch preview snippets for the given messages, batching one FETCH per
-// distinct first-text-part id (typically one or two groups per page).
+// distinct (part id, length) (typically one or two groups per page). A
+// plain-text part that yields no preview (empty, or nothing but a leftover
+// style sheet) falls back to the message's HTML part in a second round.
 async function fetchPreviewsBatched(
   client: ImapFlow,
   targets: ProcessedMeta[],
 ): Promise<Map<number, string>> {
   interface PreviewTask {
     uid: number;
-    partId: string;
-    encoding: string | null;
-    charset: string | null;
+    part: EmailBodyPart;
     isHtml: boolean;
+    maxLength: number;
+    fallback: EmailBodyPart | null;
   }
   const out = new Map<number, string>();
-  const tasks: PreviewTask[] = [];
+  let budget = PREVIEW_FETCH_BUDGET;
+  const task = (uid: number, part: EmailBodyPart, isHtml: boolean, fallback: EmailBodyPart | null): PreviewTask | null => {
+    const cap = isHtml ? PREVIEW_HTML_FETCH_BYTES : PREVIEW_TEXT_FETCH_BYTES;
+    const maxLength = part.size > 0 ? Math.min(part.size, cap) : cap;
+    if (maxLength > budget) return null; // no preview this time, and none cached
+    budget -= maxLength;
+    return { uid, part, isHtml, maxLength, fallback };
+  };
+
+  let tasks: PreviewTask[] = [];
   for (const p of targets) {
-    // textBody may hold the HTML part itself (an HTML-only message): route by type.
-    const part = p.sel.textBody.find((b) => b.partId) ?? p.sel.htmlBody.find((b) => b.partId);
-    if (!part?.partId) {
+    const { text, html } = previewParts(p.sel);
+    const part = text ?? html;
+    if (!part) {
       // No previewable part at all: the empty preview is final, cacheable.
       out.set(p.raw.uid, "");
       continue;
     }
-    tasks.push({
-      uid: p.raw.uid,
-      partId: part.partId,
-      encoding: part.encoding,
-      charset: part.charset,
-      isHtml: part.type === "text/html",
-    });
+    const t = task(p.raw.uid, part, part === html, part === html ? null : html);
+    if (t) tasks.push(t);
   }
-  const byPartId = new Map<string, PreviewTask[]>();
-  for (const t of tasks) {
-    let arr = byPartId.get(t.partId);
-    if (!arr) {
-      arr = [];
-      byPartId.set(t.partId, arr);
+
+  while (tasks.length > 0) {
+    const retry: PreviewTask[] = [];
+    const groups = new Map<string, PreviewTask[]>();
+    for (const t of tasks) {
+      const k = `${t.part.partId}\0${t.maxLength}`;
+      let arr = groups.get(k);
+      if (!arr) groups.set(k, (arr = []));
+      arr.push(t);
     }
-    arr.push(t);
-  }
-  for (const [partId, group] of byPartId) {
-    const taskByUid = new Map(group.map((t) => [t.uid, t]));
-    try {
-      for await (const m of fetchByUid(
-        client,
-        group.map((t) => t.uid),
-        { uid: true, bodyParts: [{ key: partId, start: 0, maxLength: PREVIEW_FETCH_BYTES }] },
-      )) {
-        if (m.uid == null) continue;
-        const buf = m.bodyParts?.get(partId);
-        if (!buf) continue;
-        const t = taskByUid.get(m.uid);
-        if (!t) continue;
-        const decoded = decodeTransferEncoding(buf, t.encoding);
-        out.set(m.uid, buildPreview(decodePartText(decoded, t.charset), t.isHtml));
+    for (const group of groups.values()) {
+      const first = group[0]!;
+      const partId = first.part.partId!;
+      const taskByUid = new Map(group.map((t) => [t.uid, t]));
+      try {
+        for await (const m of fetchByUid(
+          client,
+          group.map((t) => t.uid),
+          { uid: true, bodyParts: [{ key: partId, start: 0, maxLength: first.maxLength }] },
+        )) {
+          if (m.uid == null) continue;
+          const buf = m.bodyParts?.get(partId);
+          const t = taskByUid.get(m.uid);
+          if (!buf || !t) continue;
+          const decoded = decodeTransferEncoding(buf, t.part.encoding);
+          const preview = buildPreview(decodePartText(decoded, t.part.charset), t.isHtml);
+          if (preview === "" && t.fallback) {
+            const next = task(t.uid, t.fallback, true, null);
+            if (next) retry.push(next);
+            continue;
+          }
+          out.set(m.uid, preview);
+        }
+      } catch (e) {
+        // best-effort: leave preview empty (and uncached) for this group
+        log.warn({ partId, uids: group.map((t) => t.uid), ...imapErrorDetails(e) }, "preview FETCH failed");
       }
-    } catch (e) {
-      // best-effort: leave preview empty (and uncached) for this group
-      log.warn({ partId, uids: group.map((t) => t.uid), ...imapErrorDetails(e) }, "preview FETCH failed");
     }
+    tasks = retry;
   }
   return out;
 }
@@ -909,14 +923,11 @@ export async function fetchEmailsBatch(
         if (previewByUid.has(p.raw.uid)) continue;
         const values = bodyValuesByUid.get(p.raw.uid) ?? {};
         let preview = "";
-        const firstText = p.sel.textBody[0];
-        if (firstText?.partId && values[firstText.partId]) {
-          preview = buildPreview(values[firstText.partId]!.value, firstText.type === "text/html");
-        }
-        if (!preview) {
-          const firstHtml = p.sel.htmlBody[0]?.partId;
-          if (firstHtml && values[firstHtml]) preview = buildPreview(values[firstHtml].value, true);
-        }
+        const { text, html } = previewParts(p.sel);
+        const textValue = text ? values[text.partId!] : undefined;
+        const htmlValue = html ? values[html.partId!] : undefined;
+        if (textValue) preview = buildPreview(textValue.value, false);
+        if (!preview && htmlValue) preview = buildPreview(htmlValue.value, true);
         if (preview) previewByUid.set(p.raw.uid, preview);
       }
     }

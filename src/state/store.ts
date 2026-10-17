@@ -250,6 +250,22 @@ export class Store {
         this.db.pragma("user_version = 2");
       })();
     }
+    if (this.db.pragma("user_version", { simple: true }) as number < 3) {
+      // v3: previews of HTML bodies are made from the visible text only.
+      // Earlier ones could start with a style sheet or markup. Forget every
+      // cached preview (Email/get computes and caches it again on the next
+      // read) and move the Email state, so clients holding a list refetch it.
+      // The rest of the cache, the thread index and every id are kept.
+      this.db.transaction(() => {
+        this.db.exec(`UPDATE email_cache SET preview = NULL WHERE preview IS NOT NULL`);
+        const now = Date.now();
+        this.db.prepare(`UPDATE state_log SET state = state + 1, at = ? WHERE kind = 'email'`).run(now);
+        this.db
+          .prepare(`INSERT OR IGNORE INTO state_log(account_id, kind, state, at) SELECT id, 'email', 1, ? FROM account`)
+          .run(now);
+        this.db.pragma("user_version = 3");
+      })();
+    }
   }
 
   /** Prepared statement for `sql`, compiled once and cached. */

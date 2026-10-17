@@ -31,6 +31,7 @@
     "better-sqlite3": "^11.5.0",
     "fastify": "^5.1.0",
     "google-auth-library": "^11.0.2",
+    "htmlparser2": "10.1.0",
     "imapflow": "^1.7.8",
     "libqp": "^2.1.1",
     "mailparser": "3.9.32",
