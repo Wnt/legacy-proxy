@@ -77,48 +77,79 @@ export interface SelectedBodies {
   hasAttachment: boolean;
 }
 
-// Implements RFC 8621 §4.1.4 selection algorithm.
+// Implements the RFC 8621 §4.1.4 selection algorithm for text/plain and
+// text/html: outside a multipart/alternative a text part is both the text and
+// the HTML body; inside one, an alternative that has only an HTML (or only a
+// plain-text) version uses it for both lists. So an HTML-only message has its
+// HTML part in textBody too, as every RFC 8621 server returns it; clients that
+// read textBody (summaries, previews, plugins) are never left without a body.
+// Other leaves keep this proxy's simpler rule: non-text parts outside an
+// alternative are attachments, other text/* parts are in both lists.
 export function selectBodies(root: EmailBodyPart): SelectedBodies {
   const textBody: EmailBodyPart[] = [];
   const htmlBody: EmailBodyPart[] = [];
   const attachments: EmailBodyPart[] = [];
 
-  function walk(node: EmailBodyPart, multipartType: string | null, inAlternative: boolean): void {
-    const ct = node.type;
-    if (node.subParts === null) {
+  function parse(
+    parts: EmailBodyPart[],
+    multipartType: string | null,
+    inAlternative: boolean,
+    text: EmailBodyPart[] | null,
+    html: EmailBodyPart[] | null,
+  ): void {
+    const textLength = text ? text.length : -1;
+    const htmlLength = html ? html.length : -1;
+    for (const node of parts) {
+      const ct = node.type;
+      if (node.subParts !== null) {
+        const sub = ct.replace(/^multipart\//, "");
+        parse(node.subParts, sub, inAlternative || sub === "alternative", text, html);
+        continue;
+      }
       const isAttachment =
         node.disposition === "attachment" ||
-        (multipartType !== "alternative" && !ct.startsWith("text/") && !ct.startsWith("multipart/"));
+        (multipartType !== "alternative" && !ct.startsWith("text/"));
       if (isAttachment) {
         attachments.push(node);
-      } else if (ct === "text/plain") {
-        textBody.push(node);
-        if (inAlternative) {
-          // alt: also surface as html (RFC 8621 §4.1.4 chooses the matching one)
+        continue;
+      }
+      if (ct !== "text/plain" && ct !== "text/html") {
+        if (ct.startsWith("text/")) {
+          text?.push(node);
+          html?.push(node);
         }
-      } else if (ct === "text/html") {
-        htmlBody.push(node);
-      } else if (ct.startsWith("text/")) {
-        textBody.push(node);
-        htmlBody.push(node);
+        continue;
       }
-      return;
-    }
-    const sub = ct.replace(/^multipart\//, "");
-    if (sub === "alternative") {
-      const plain = node.subParts.find((p) => p.type === "text/plain") ?? null;
-      const html = node.subParts.find((p) => p.type === "text/html") ?? null;
-      if (plain) walk(plain, sub, true);
-      if (html) walk(html, sub, true);
-      for (const child of node.subParts) {
-        if (child !== plain && child !== html) walk(child, sub, true);
+      if (multipartType === "alternative") {
+        if (ct === "text/plain") text?.push(node);
+        else html?.push(node);
+        continue;
       }
-      return;
+      if (inAlternative) {
+        // e.g. alternative{text/plain, related{text/html, image}}: the HTML
+        // branch belongs to htmlBody only, the plain branch to textBody only.
+        if (ct === "text/plain") html = null;
+        else text = null;
+      }
+      text?.push(node);
+      html?.push(node);
     }
-    for (const child of node.subParts) walk(child, sub, false);
+    if (multipartType === "alternative" && text && html) {
+      // Parts this alternative added to one list only (other text/* parts go
+      // to both and do not count as a version).
+      const addedText = text.slice(textLength).filter((p) => !html!.slice(htmlLength).includes(p));
+      const addedHtml = html.slice(htmlLength).filter((p) => !text!.slice(textLength).includes(p));
+      if (addedText.length === 0 && addedHtml.length > 0) text.push(...addedHtml);
+      if (addedHtml.length === 0 && addedText.length > 0) html.push(...addedText);
+    }
   }
 
-  walk(root, null, false);
+  if (root.subParts === null) {
+    parse([root], null, false, textBody, htmlBody);
+  } else {
+    const sub = root.type.replace(/^multipart\//, "");
+    parse(root.subParts, sub, sub === "alternative", textBody, htmlBody);
+  }
   return {
     textBody,
     htmlBody,

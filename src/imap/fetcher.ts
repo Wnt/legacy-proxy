@@ -197,11 +197,30 @@ export interface BodyFetchOpts {
 }
 
 function decodePartText(buf: Buffer, charset: string | null): string {
+  return decodePartTextChecked(buf, charset, false).value;
+}
+
+/**
+ * Decode a text part and say whether that went wrong (RFC 8621 bodyValue
+ * `isEncodingProblem`): an unknown charset, or bytes that are not valid in it.
+ * `partial` (a value cut at a byte limit) tolerates a cut final character.
+ */
+export function decodePartTextChecked(
+  buf: Buffer,
+  charset: string | null,
+  partial: boolean,
+): { value: string; problem: boolean } {
   const cs = (charset ?? "utf-8").toLowerCase();
+  let strict: TextDecoder;
   try {
-    return new TextDecoder(cs, { fatal: false }).decode(buf);
+    strict = new TextDecoder(cs, { fatal: true });
   } catch {
-    return buf.toString("utf8");
+    return { value: buf.toString("utf8"), problem: true };
+  }
+  try {
+    return { value: strict.decode(buf, { stream: partial }), problem: false };
+  } catch {
+    return { value: new TextDecoder(cs, { fatal: false }).decode(buf, { stream: partial }), problem: true };
   }
 }
 
@@ -643,9 +662,10 @@ async function fetchBodyValuesBatched(
         const cutOnWire = raw.length >= ceiling.get(partId)! && !(part.size > 0 && part.size <= raw.length);
         const truncated = decoded.length > cap || cutOnWire;
         const slice = decoded.length > cap ? decoded.subarray(0, cap) : decoded;
+        const text = decodePartTextChecked(slice, part.charset, truncated);
         values[partId] = {
-          value: decodePartText(slice, part.charset),
-          isEncodingProblem: false,
+          value: text.value,
+          isEncodingProblem: text.problem,
           isTruncated: truncated,
         };
       }
@@ -671,9 +691,8 @@ async function fetchPreviewsBatched(
   const out = new Map<number, string>();
   const tasks: PreviewTask[] = [];
   for (const p of targets) {
-    const text = p.sel.textBody.find((b) => b.partId);
-    const html = p.sel.htmlBody.find((b) => b.partId);
-    const part = text ?? html;
+    // textBody may hold the HTML part itself (an HTML-only message): route by type.
+    const part = p.sel.textBody.find((b) => b.partId) ?? p.sel.htmlBody.find((b) => b.partId);
     if (!part?.partId) {
       // No previewable part at all: the empty preview is final, cacheable.
       out.set(p.raw.uid, "");
@@ -684,7 +703,7 @@ async function fetchPreviewsBatched(
       partId: part.partId,
       encoding: part.encoding,
       charset: part.charset,
-      isHtml: !text,
+      isHtml: part.type === "text/html",
     });
   }
   const byPartId = new Map<string, PreviewTask[]>();
@@ -890,8 +909,10 @@ export async function fetchEmailsBatch(
         if (previewByUid.has(p.raw.uid)) continue;
         const values = bodyValuesByUid.get(p.raw.uid) ?? {};
         let preview = "";
-        const firstText = p.sel.textBody[0]?.partId;
-        if (firstText && values[firstText]) preview = buildPreview(values[firstText].value, false);
+        const firstText = p.sel.textBody[0];
+        if (firstText?.partId && values[firstText.partId]) {
+          preview = buildPreview(values[firstText.partId]!.value, firstText.type === "text/html");
+        }
         if (!preview) {
           const firstHtml = p.sel.htmlBody[0]?.partId;
           if (firstHtml && values[firstHtml]) preview = buildPreview(values[firstHtml].value, true);
