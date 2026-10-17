@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ImapFlow } from "imapflow";
 import { Store } from "../../src/state/store.js";
-import { emailQuery } from "../../src/jmap/methods/email.js";
+import { emailQuery, resetSearchCachesInMemory } from "../../src/jmap/methods/email.js";
 
 let dir: string;
 let store: Store;
@@ -24,6 +24,9 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+// UIDVALIDITY per folder path (default 1).
+const uidValidity: Record<string, bigint> = {};
+
 type Folder = { modseq: bigint; uidNext: number; msgs: { uid: number; kw: string[]; date: number }[] };
 
 function fakeServer(folders: Record<string, Folder>) {
@@ -36,7 +39,7 @@ function fakeServer(folders: Record<string, Folder>) {
       log.lists++;
       return Object.entries(folders).map(([p, f]) => ({
         path: p, name: p, delimiter: "/", subscribed: true,
-        status: { messages: f.msgs.length, unseen: 0, uidNext: f.uidNext, uidValidity: 1n, highestModseq: f.modseq },
+        status: { messages: f.msgs.length, unseen: 0, uidNext: f.uidNext, uidValidity: uidValidity[p] ?? 1n, highestModseq: f.modseq },
       }));
     },
     // One SELECTed folder per session, as imapflow's mailbox lock ensures.
@@ -47,7 +50,7 @@ function fakeServer(folders: Record<string, Folder>) {
       await prev;
       log.selects++;
       const f = folders[p]!;
-      client.mailbox = { path: p, exists: f.msgs.length, uidValidity: 1n, highestModseq: f.modseq };
+      client.mailbox = { path: p, exists: f.msgs.length, uidValidity: uidValidity[p] ?? 1n, highestModseq: f.modseq };
       return { release };
     },
     search: async (q: { keyword?: string }) => {
@@ -122,5 +125,34 @@ describe("account-wide Email/query folder search cache", () => {
     log.searches = [];
     expect((await q()).total).toBe(2);
     expect(log.searches).toEqual(["INBOX"]);
+  });
+
+  it("keeps the folder results across a restart, and drops them on a new UIDVALIDITY", async () => {
+    const folders: Record<string, Folder> = {
+      INBOX: { modseq: 10n, uidNext: 3, msgs: [{ uid: 1, kw: ["$label:a"], date: 1000 }, { uid: 2, kw: [], date: 2000 }] },
+      Archive: { modseq: 5n, uidNext: 8, msgs: [{ uid: 7, kw: ["$label:a"], date: 500 }] },
+    };
+    const { client, log } = fakeServer(folders);
+    for (const slug of ["y1", "y2", "y3", "y4", "y5", "y6"]) store.upsertAccount({ slug, kind: "generic", host: "h", username: "u", vault: Buffer.from("v") });
+    const account = store.upsertAccount({ slug: "r", kind: "generic", host: "h", username: "u", vault: Buffer.from("v") });
+    const ctx = { account, client, store };
+    const q = () => emailQuery({ accountId: String(account.id), filter: { hasKeyword: "$label:a" }, limit: 10 } as never, ctx);
+    const first = await q();
+    expect(log.searches.sort()).toEqual(["Archive", "INBOX"]);
+
+    resetSearchCachesInMemory(); // a restart: only SQLite remains
+    log.searches = [];
+    expect((await q()).ids).toEqual(first.ids);
+    expect(log.searches).toEqual([]);
+
+    // A recreated folder (new UIDVALIDITY) is searched again; its old row goes.
+    const rows = () => (store.db.prepare("SELECT COUNT(*) AS n FROM folder_search_cache WHERE account_id = ?").get(account.id) as { n: number }).n;
+    expect(rows()).toBe(2);
+    resetSearchCachesInMemory();
+    uidValidity.INBOX = 2n;
+    log.searches = [];
+    await q();
+    expect(log.searches).toEqual(["INBOX"]);
+    expect(rows()).toBe(2);
   });
 });

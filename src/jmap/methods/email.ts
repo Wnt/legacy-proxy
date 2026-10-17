@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ImapFlow } from "imapflow";
 import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
 import { viewEmailState, type ImapPool } from "../../imap/pool.js";
@@ -179,7 +180,7 @@ function pruneSearchCache(): void {
 // the new state, and imapflow's cached mailbox.highestModseq isn't always
 // advanced on the same connection that did the APPEND, so the modseq guard
 // alone can serve a stale answer.
-function invalidateSearchCacheForAccount(accountId: number): void {
+function invalidateSearchCacheForAccount(accountId: number, store?: Store): void {
   const prefix = `${accountId}|`;
   for (const k of [...searchCache.keys()]) {
     if (k.startsWith(prefix)) searchCache.delete(k);
@@ -188,6 +189,11 @@ function invalidateSearchCacheForAccount(accountId: number): void {
     if (k.startsWith(prefix)) folderSearchCache.delete(k);
   }
   folderSnapshots.delete(accountId);
+  try {
+    store?.deleteFolderSearches(accountId);
+  } catch (e) {
+    log.warn({ err: (e as Error).message }, "folder search cache purge failed");
+  }
 }
 
 // The account email state that results read on `client` include: the state
@@ -735,11 +741,56 @@ async function folderSnapshot(ctx: MailCtx, emailState: number): Promise<FolderS
   }
 }
 
+/** Forget the in-memory search caches, as a restart does (tests). */
+export function resetSearchCachesInMemory(): void {
+  searchCache.clear();
+  folderSearchCache.clear();
+  folderSnapshots.clear();
+}
+
 function sameFolderStatus(a: FolderStatus, b: FolderStatus): boolean {
   return a.uidValidity === b.uidValidity && a.uidNext === b.uidNext && a.messages === b.messages && a.modseq === b.modseq;
 }
 
-function putFolderSearch(key: string, entry: FolderSearchEntry): void {
+// The results also live in SQLite (folder_search_cache), so a restart does
+// not cost one full re-search of every folder: a row is only ever used while
+// the folder's live STATUS matches the one it was filed under, and rows of an
+// older UIDVALIDITY are dropped when a newer one is filed.
+function getFolderSearch(store: Store, accountId: number, idx: number, uidvalidity: number, filterHash: string): FolderSearchEntry | null {
+  const key = `${accountId}|${idx}|${uidvalidity}|${filterHash}`;
+  const mem = folderSearchCache.get(key);
+  if (mem) return mem;
+  try {
+    const row = store.getFolderSearch(accountId, idx, uidvalidity, filterHash);
+    if (!row) return null;
+    const uids = JSON.parse(row.uids) as unknown;
+    if (!Array.isArray(uids) || !uids.every((u) => Number.isInteger(u) && u > 0)) return null;
+    const entry: FolderSearchEntry = { uidValidity: uidvalidity, uidNext: row.uid_next, messages: row.messages, modseq: row.modseq, uids: uids as number[] };
+    rememberFolderSearch(key, entry);
+    return entry;
+  } catch (e) {
+    log.warn({ err: (e as Error).message }, "folder search cache read failed");
+    return null;
+  }
+}
+
+// Above this many hits a result is kept in memory only.
+const FOLDER_SEARCH_PERSIST_MAX_UIDS = 50_000;
+
+function putFolderSearch(store: Store, accountId: number, idx: number, filterHash: string, entry: FolderSearchEntry): void {
+  rememberFolderSearch(`${accountId}|${idx}|${entry.uidValidity}|${filterHash}`, entry);
+  if (entry.uids.length > FOLDER_SEARCH_PERSIST_MAX_UIDS) return;
+  try {
+    store.putFolderSearch({
+      accountId, mailboxId: idx, uidvalidity: entry.uidValidity, filterHash,
+      uidNext: entry.uidNext, messages: entry.messages, modseq: entry.modseq, uids: JSON.stringify(entry.uids),
+    }, FOLDER_SEARCH_CACHE_MAX);
+  } catch (e) {
+    log.warn({ err: (e as Error).message }, "folder search cache write failed");
+  }
+}
+
+function rememberFolderSearch(key: string, entry: FolderSearchEntry): void {
   folderSearchCache.delete(key);
   folderSearchCache.set(key, entry);
   if (folderSearchCache.size <= FOLDER_SEARCH_CACHE_MAX) return;
@@ -796,8 +847,7 @@ async function emailQueryAccountWideFull(
   // change. Without it (LIST failed, or a server without CONDSTORE) every
   // folder is searched, as before.
   const snapshot = await folderSnapshot(ctx, emailState);
-  const filterHash = stableHash(filter);
-  const folderKey = (idx: number, uidvalidity: number) => `${ctx.account.id}|${idx}|${uidvalidity}|${filterHash}`;
+  const filterHash = createHash("sha256").update(stableHash(filter)).digest("hex");
 
   const targets: Array<{ idx: number; row: MboxRow }> = [];
   for (const m of all) {
@@ -820,7 +870,7 @@ async function emailQueryAccountWideFull(
     if (needsFetch || !snapshot) return null;
     const live = snapshot.byPath.get(row.name);
     if (!live) return null;
-    const hit = folderSearchCache.get(folderKey(idx, live.uidValidity));
+    const hit = getFolderSearch(ctx.store, ctx.account.id, idx, live.uidValidity, filterHash);
     if (!hit || !sameFolderStatus(hit, live)) return null;
     if (hit.uids.length === 0) return [];
     const rows = ctx.store.getEmailCacheRows(ctx.account.id, idx, live.uidValidity, hit.uids);
@@ -854,7 +904,7 @@ async function emailQueryAccountWideFull(
       // it, so a change made in between only causes a needless re-search.
       const live = snapshot?.byPath.get(row.name);
       if (!uids && live && live.uidValidity === uidvalidity) {
-        const prev = folderSearchCache.get(folderKey(idx, uidvalidity));
+        const prev = getFolderSearch(ctx.store, ctx.account.id, idx, uidvalidity, filterHash);
         if (prev && sameFolderStatus(prev, live)) uids = prev.uids;
       }
       if (!uids) {
@@ -867,7 +917,7 @@ async function emailQueryAccountWideFull(
           expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
         });
         pruneSearchCache();
-        if (live && live.uidValidity === uidvalidity) putFolderSearch(folderKey(idx, uidvalidity), { ...live, uids });
+        if (live && live.uidValidity === uidvalidity) putFolderSearch(ctx.store, ctx.account.id, idx, filterHash, { ...live, uids });
       }
       if (uids.length === 0) return;
 
@@ -1276,7 +1326,7 @@ export async function emailSet(
     Object.keys(updated).length > 0 ||
     destroyed.length > 0;
   if (mutated) {
-    invalidateSearchCacheForAccount(ctx.account.id);
+    invalidateSearchCacheForAccount(ctx.account.id, ctx.store);
     ctx.store.recordChanges(ctx.account.id, "email", {
       created: Object.entries(created).map(([, r]) => (r as { id: string }).id),
       updated: Object.keys(updated),
@@ -2090,7 +2140,7 @@ export async function emailImport(
     }
   }
   if (Object.keys(created).length > 0) {
-    invalidateSearchCacheForAccount(ctx.account.id);
+    invalidateSearchCacheForAccount(ctx.account.id, ctx.store);
     ctx.store.recordChanges(ctx.account.id, "email", {
       created: Object.values(created).map((c) => c.id),
     });
@@ -2361,7 +2411,7 @@ export async function emailCopy(
   }
 
   if (Object.keys(created).length > 0) {
-    invalidateSearchCacheForAccount(ctx.account.id);
+    invalidateSearchCacheForAccount(ctx.account.id, ctx.store);
     ctx.store.recordChanges(ctx.account.id, "email", {
       created: Object.values(created).map((c) => c.id),
       destroyed: args.onSuccessDestroyOriginal ? successfulOriginals : [],

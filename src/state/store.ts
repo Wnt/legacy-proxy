@@ -146,6 +146,23 @@ CREATE TABLE IF NOT EXISTS body_cache (
 );
 CREATE INDEX IF NOT EXISTS body_cache_expires_idx ON body_cache(expires);
 
+-- Account-wide Email/query: one folder's SEARCH result per filter, filed
+-- under the folder STATUS (UIDNEXT, MESSAGES, HIGHESTMODSEQ) read just
+-- before it. Only used while the live STATUS still matches; see
+-- jmap/methods/email.ts getFolderSearch.
+CREATE TABLE IF NOT EXISTS folder_search_cache (
+  account_id  INTEGER NOT NULL,
+  mailbox_id  INTEGER NOT NULL REFERENCES mailbox(id) ON DELETE CASCADE,
+  uidvalidity INTEGER NOT NULL,
+  filter_hash TEXT    NOT NULL,
+  uid_next    INTEGER NOT NULL,
+  messages    INTEGER NOT NULL,
+  modseq      TEXT    NOT NULL,
+  uids        TEXT    NOT NULL,
+  at          INTEGER NOT NULL,
+  PRIMARY KEY (account_id, mailbox_id, filter_hash, uidvalidity)
+);
+
 CREATE TABLE IF NOT EXISTS upload (
   id         TEXT PRIMARY KEY,
   account_id INTEGER NOT NULL,
@@ -534,6 +551,46 @@ export class Store {
         )
         .run();
     }
+  }
+
+  getFolderSearch(accountId: number, mailboxId: number, uidvalidity: number, filterHash: string):
+    { uid_next: number; messages: number; modseq: string; uids: string } | null {
+    const row = this.prep(
+        `SELECT uid_next, messages, modseq, uids FROM folder_search_cache
+         WHERE account_id = ? AND mailbox_id = ? AND filter_hash = ? AND uidvalidity = ?`,
+      )
+      .get(accountId, mailboxId, filterHash, uidvalidity) as
+      | { uid_next: number; messages: number; modseq: string; uids: string }
+      | undefined;
+    return row ?? null;
+  }
+
+  /** File one result; drops the same search under another UIDVALIDITY and keeps at most `maxRows` per account. */
+  putFolderSearch(
+    p: { accountId: number; mailboxId: number; uidvalidity: number; filterHash: string; uidNext: number; messages: number; modseq: string; uids: string },
+    maxRows: number,
+  ): void {
+    const txn = this.db.transaction(() => {
+      this.prep(`DELETE FROM folder_search_cache WHERE account_id = ? AND mailbox_id = ? AND filter_hash = ? AND uidvalidity <> ?`)
+        .run(p.accountId, p.mailboxId, p.filterHash, p.uidvalidity);
+      this.prep(
+          `INSERT INTO folder_search_cache(account_id, mailbox_id, uidvalidity, filter_hash, uid_next, messages, modseq, uids, at)
+           VALUES(?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(account_id, mailbox_id, filter_hash, uidvalidity) DO UPDATE SET
+             uid_next=excluded.uid_next, messages=excluded.messages, modseq=excluded.modseq, uids=excluded.uids, at=excluded.at`,
+        )
+        .run(p.accountId, p.mailboxId, p.uidvalidity, p.filterHash, p.uidNext, p.messages, p.modseq, p.uids, Date.now());
+      this.prep(
+          `DELETE FROM folder_search_cache WHERE account_id = ? AND rowid IN (
+             SELECT rowid FROM folder_search_cache WHERE account_id = ? ORDER BY at DESC LIMIT -1 OFFSET ?)`,
+        )
+        .run(p.accountId, p.accountId, maxRows);
+    });
+    txn();
+  }
+
+  deleteFolderSearches(accountId: number): void {
+    this.prep(`DELETE FROM folder_search_cache WHERE account_id = ?`).run(accountId);
   }
 
   putUpload(p: { id: string; accountId: number; ctype: string; body: Buffer }): void {
