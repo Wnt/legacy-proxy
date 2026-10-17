@@ -20,6 +20,7 @@ import { imapErrorDetails } from "./client.js";
 import { fetchByUid } from "./uids.js";
 import type { AccountRow, MailboxRow, Store, EmailCacheUpsert } from "../state/store.js";
 import { log } from "../util/log.js";
+import { storeBodyCache, type BodyCache } from "./bodycache.js";
 
 // The header fields threading and the default Email/get property set need:
 // References for threadId + `references`, In-Reply-To / Message-ID as backup.
@@ -195,6 +196,8 @@ export interface BodyFetchOpts {
   bodyBudget?: { remaining: number };
   metadataBudget?: { remaining: number };
   signal?: AbortSignal;
+  // Raw text parts by blobId; fetchEmailsBatch sets it from its Store.
+  bodyCache?: BodyCache;
 }
 
 function decodePartText(buf: Buffer, charset: string | null): string {
@@ -585,6 +588,39 @@ export function encodedCeiling(cap: number, encoding: string | null): number {
 // part-id set instead of one FETCH per message. Sibling messages in a thread
 // almost always share the same MIME shape ("1" or "1.1"+"1.2"), so an open
 // thread of N messages collapses to one or two round trips.
+// Fill rawByUid for `m` from the body cache when every one of its parts is
+// there; true if so.
+function cachedParts(
+  cache: BodyCache,
+  m: { uid: number; wanted: Map<string, EmailBodyPart> },
+  parts: { partId: string; maxLength: number }[],
+  rawByUid: Map<number, Map<string, Buffer>>,
+): boolean {
+  const got = new Map<string, Buffer>();
+  for (const p of parts) {
+    const blobId = m.wanted.get(p.partId)?.blobId;
+    const raw = blobId ? cache.get(blobId, p.maxLength) : null;
+    if (!raw) return false;
+    got.set(p.partId, raw);
+  }
+  rawByUid.set(m.uid, got);
+  return true;
+}
+
+function cacheParts(
+  cache: BodyCache,
+  m: { wanted: Map<string, EmailBodyPart> } | undefined,
+  parts: { partId: string; maxLength: number }[],
+  fetched: Map<string, Buffer>,
+): void {
+  if (!m) return;
+  for (const p of parts) {
+    const blobId = m.wanted.get(p.partId)?.blobId;
+    const raw = fetched.get(p.partId);
+    if (blobId && raw) cache.put(blobId, p.maxLength, raw);
+  }
+}
+
 async function fetchBodyValuesBatched(
   client: ImapFlow,
   items: { uid: number; wanted: Map<string, EmailBodyPart> }[],
@@ -629,14 +665,19 @@ async function fetchBodyValuesBatched(
     checkAborted(opts.signal);
     const byUid = new Map(g.members.map((m) => [m.uid, m]));
     const rawByUid = new Map<number, Map<string, Buffer>>();
+    // Members whose every part is in the body cache need no FETCH.
+    const toFetch = opts.bodyCache ? g.members.filter((m) => !cachedParts(opts.bodyCache!, m, g.parts, rawByUid)) : g.members;
     try {
-      for await (const msg of fetchByUid(
+      if (toFetch.length > 0) for await (const msg of fetchByUid(
         client,
-        g.members.map((m) => m.uid),
+        toFetch.map((m) => m.uid),
         { uid: true, bodyParts: g.parts.map((p) => ({ key: p.partId, start: 0, maxLength: p.maxLength })) },
       )) {
         checkAborted(opts.signal);
-        if (msg.uid != null && msg.bodyParts) rawByUid.set(msg.uid, msg.bodyParts);
+        if (msg.uid != null && msg.bodyParts) {
+          rawByUid.set(msg.uid, msg.bodyParts);
+          if (opts.bodyCache) cacheParts(opts.bodyCache, byUid.get(msg.uid), g.parts, msg.bodyParts);
+        }
       }
     } catch (e) {
       // An abandoned request stops here; only IMAP failures are best-effort.
@@ -908,7 +949,7 @@ export async function fetchEmailsBatch(
     bodyValuesByUid = await fetchBodyValuesBatched(
       client,
       processed.map((p) => ({ uid: p.raw.uid, wanted: wantedBodyParts(p.sel, bodyOpts) })),
-      bodyOpts,
+      store && !bodyOpts.bodyCache ? { ...bodyOpts, bodyCache: storeBodyCache(store, account.id) } : bodyOpts,
     );
   }
 

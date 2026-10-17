@@ -12,6 +12,7 @@
 // means a request-path connection drop never costs us push uptime.
 
 import { ImapFlow } from "imapflow";
+import { prefetchEmails } from "../imap/prefetch.js";
 import type { Credentials } from "../auth/credentials.js";
 import { openCredentials } from "../auth/credentials.js";
 import { resolveProvider } from "../auth/providers.js";
@@ -284,6 +285,8 @@ export class PushIdleManager {
     const destroyed = before.filter((u) => !is.has(u)).map((u) => this.emailId(account.id, uidValidity, u));
     if (created.length === 0 && destroyed.length === 0) return;
     this.store.recordChanges(account.id, "email", { created, destroyed });
+    // New mail is what gets opened next: warm it (newest first).
+    if (created.length > 0) prefetchEmails(this.pool, this.store, account, [...created].reverse());
     // New arrivals bump the counter the webmail's PushSubscription opts in
     // to; mailbox counts moved either way.
     if (created.length > 0) this.store.bumpState(account.id, "email_delivery");

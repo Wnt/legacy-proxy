@@ -130,6 +130,22 @@ CREATE TABLE IF NOT EXISTS blob_cache (
   expires    INTEGER NOT NULL
 );
 
+-- Raw (still transfer-encoded) bytes of text body parts, keyed by the part's
+-- blobId, as fetched by Email/get body values or the prefetch. Like
+-- blob_cache, a hit is always current: the bytes behind a blobId's
+-- (mailbox, uidvalidity, uid, part) never change. max_len is the partial
+-- FETCH length the bytes came from; fewer bytes than that means the whole
+-- part. expires and the size cap bound disk use, not correctness.
+CREATE TABLE IF NOT EXISTS body_cache (
+  id         TEXT PRIMARY KEY,
+  account_id INTEGER NOT NULL,
+  max_len    INTEGER NOT NULL,
+  size       INTEGER NOT NULL,
+  body       BLOB NOT NULL,
+  expires    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS body_cache_expires_idx ON body_cache(expires);
+
 CREATE TABLE IF NOT EXISTS upload (
   id         TEXT PRIMARY KEY,
   account_id INTEGER NOT NULL,
@@ -477,6 +493,38 @@ export class Store {
          )`,
       )
       .run();
+  }
+
+  getCachedBodyPart(id: string, accountId: number): { maxLen: number; body: Buffer } | null {
+    const row = this.prep(`SELECT max_len AS maxLen, body FROM body_cache WHERE id = ? AND account_id = ? AND expires > ?`)
+      .get(id, accountId, Date.now()) as { maxLen: number; body: Buffer } | undefined;
+    return row ?? null;
+  }
+
+  putCachedBodyPart(p: { id: string; accountId: number; maxLen: number; body: Buffer; ttlMs: number }): void {
+    this.prep(
+        `INSERT INTO body_cache(id, account_id, max_len, size, body, expires)
+         VALUES(?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET max_len=excluded.max_len, size=excluded.size,
+                                       body=excluded.body, expires=excluded.expires`,
+      )
+      .run(p.id, p.accountId, p.maxLen, p.body.length, p.body, Date.now() + p.ttlMs);
+  }
+
+  /** Drop expired body parts, and the soonest-to-expire quarter while over `maxBytes`. */
+  pruneBodyCache(maxBytes: number): void {
+    this.prep(`DELETE FROM body_cache WHERE expires <= ?`).run(Date.now());
+    for (let i = 0; i < 8; i++) {
+      const total = (this.prep(`SELECT COALESCE(SUM(size), 0) AS n FROM body_cache`).get() as { n: number }).n;
+      if (total <= maxBytes) return;
+      this.prep(
+          `DELETE FROM body_cache WHERE id IN (
+             SELECT id FROM body_cache ORDER BY expires ASC
+             LIMIT MAX(1, (SELECT COUNT(*) FROM body_cache) / 4)
+           )`,
+        )
+        .run();
+    }
   }
 
   putUpload(p: { id: string; accountId: number; ctype: string; body: Buffer }): void {

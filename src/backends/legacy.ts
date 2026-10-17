@@ -1,5 +1,7 @@
 import { newRequestBudgets, type RequestBudgets } from "../imap/fetcher.js";
 import type { ImapPool } from "../imap/pool.js";
+import { prefetchEmails } from "../imap/prefetch.js";
+import { decodeMailboxId } from "../mapping/ids.js";
 import type { Store, AccountRow } from "../state/store.js";
 import type { AppConfig } from "../util/config.js";
 import type { PushDispatcher } from "../push/dispatcher.js";
@@ -174,10 +176,14 @@ function makeMethodTable(): Record<string, Handler> {
       c.pool.withConnection(c.account, "interactive", (client) =>
         mailboxSet(a as never, { account: c.account, client, store: c.store }),
       ),
-    "Email/query": async (a, c) =>
-      c.pool.withConnection(c.account, "interactive", (client) =>
+    "Email/query": async (a, c) => {
+      const res = await c.pool.withConnection(c.account, "interactive", (client) =>
         emailQuery(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
-      ),
+      );
+      // The top of the INBOX list is what gets opened next: warm it.
+      if (isInboxFirstPage(a, c.store, c.account.id)) prefetchEmails(c.pool, c.store, c.account, res.ids);
+      return res;
+    },
     "Email/get": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
         emailGet(a as never, {
@@ -268,4 +274,22 @@ export function makeLegacyMethods(ctx: LegacyContext): MethodTable {
   return Object.fromEntries(
     Object.entries(TABLE).map(([name, handler]) => [name, (args: Record<string, unknown>) => handler(args, withBudgets)]),
   );
+}
+
+// An Email/query for the first page of the INBOX (filter `inMailbox`, alone
+// or in a top-level AND).
+function isInboxFirstPage(args: unknown, store: Store, accountId: number): boolean {
+  const a = args as { filter?: Record<string, unknown>; position?: number; anchor?: unknown } | null;
+  if (!a || (a.position ?? 0) !== 0 || a.anchor != null || !a.filter) return false;
+  const f = a.filter;
+  const conds = f.operator === "AND" && Array.isArray(f.conditions) ? (f.conditions as Record<string, unknown>[]) : [f];
+  const mbox = conds.find((x) => typeof x?.inMailbox === "string")?.inMailbox as string | undefined;
+  if (!mbox) return false;
+  try {
+    const idx = decodeMailboxId(mbox).mailboxIdx;
+    const row = store.prep(`SELECT role FROM mailbox WHERE id = ? AND account_id = ?`).get(idx, accountId) as { role: string | null } | undefined;
+    return row?.role === "inbox";
+  } catch {
+    return false;
+  }
 }
