@@ -35,6 +35,10 @@ describe("htmlPreview", () => {
     expect(htmlPreview(NEWSLETTER.slice(0, 4096))).toBe("");
   });
 
+  it("drops CSS that sits in the body as text", () => {
+    expect(htmlPreview("<body><p>Hello</p><p>td.x { padding: 0 } table { border-collapse: collapse }</p><p>World</p>")).toBe("Hello World");
+  });
+
   it("never shows markup when the prefix ends inside a tag or a comment", () => {
     expect(htmlPreview("<p>Visible text</p><a href=\"https://exa")).toBe("Visible text");
     expect(htmlPreview("<p>Visible text</p><!-- a comment that goes on {")).toBe("Visible text");
@@ -81,14 +85,30 @@ describe("htmlPreview", () => {
 });
 
 describe("plainPreview", () => {
-  it("keeps plain text as written, entities and angle brackets included", () => {
-    expect(plainPreview("Hi,\n\nsee <https://example.com> &amp; reply.\r\n")).toBe("Hi, see <https://example.com> &amp; reply.");
+  it("keeps angle-bracketed links and addresses, decodes entity references", () => {
+    expect(plainPreview("Hi,\n\nsee <https://example.com> &amp; reply to <a@example.com>.\r\n")).toBe("Hi, see <https://example.com> & reply to <a@example.com>.");
+    expect(plainPreview("It&#8217;s 5&nbsp;&euro; &lt;cheap&gt; AT&T Q&A")).toBe("It\u2019s 5 € <cheap> AT&T Q&A");
+  });
+
+  it("drops tags a converter left in a plain-text part", () => {
+    expect(plainPreview("Click <a href=\"https://x\">here</a> or <span style=\"color:red\">now</span><br>Bye")).toBe("Click here or now Bye");
+  });
+
+  it("drops CSS rules after the first words, not prose in braces", () => {
+    expect(plainPreview("View this email in your browser p { margin: 0; } .hdr td { padding:0 !important } Hello Jonni")).toBe("View this email in your browser Hello Jonni");
+    expect(plainPreview("Intro text @media only screen and (max-width:600px) { .col { width:100% !important; } } Body")).toBe("Intro text Body");
+    expect(plainPreview("Intro text .x { color: red; font-size: 1")).toBe("Intro text");
+    expect(plainPreview("Join us {at 5pm} and bring {color: your own mug}")).toBe("Join us {at 5pm} and bring {color: your own mug}");
   });
 
   it("drops a style sheet a converter left at the start", () => {
     expect(plainPreview("/* reset */ body { margin: 0; }\n@media screen and (max-width: 600px) { .a { width: 100% } }\n\nHello there")).toBe("Hello there");
     expect(plainPreview("td{padding:0} .x{color:red}")).toBe("");
     expect(plainPreview(".btn { color: red; ")).toBe("");
+  });
+
+  it("recognises the selectors email style sheets use", () => {
+    expect(plainPreview("#outlook a { padding:0; } .ReadMsgBody { width:100%; } a[x-apple-data-detectors] { color:inherit !important; } [data-ogsc] .dark, u + .body .x { color:#fff } *[x-apple-data-detectors] { color:inherit } td:hover, a::after { display:none } Text")).toBe("Text");
   });
 
   it("leaves prose with braces alone", () => {
@@ -107,7 +127,7 @@ describe("plainPreview", () => {
 
   it("buildPreview picks the converter by part type", () => {
     expect(buildPreview("<b>x</b>", true)).toBe("x");
-    expect(buildPreview("a <b> c", false)).toBe("a <b> c");
+    expect(buildPreview("a <https://x> c", false)).toBe("a <https://x> c");
   });
 });
 
@@ -210,21 +230,21 @@ describe("fetchEmailsBatch preview", () => {
   });
 });
 
-describe("cache upgrade to v3", () => {
+describe("cache upgrade to v4", () => {
   it("forgets cached previews, keeps the rest of the row, and moves the Email state", async () => {
     store.upsertEmailCacheRows([{ accountId: 1, mailboxId: 2, uidvalidity: 1, uid: 7, threadId: "T1", internaldate: 5,
       threadInputs: JSON.stringify({ messageId: null, inReplyTo: null, references: null }),
       envelope: JSON.stringify({ subject: "s" }), bodystructure: JSON.stringify(leaf("1", HTML)),
       preview: "td{color:red} .x{margin:0}" }]);
     const before = store.getState(1, "email");
-    store.db.pragma("user_version = 2");
+    store.db.pragma("user_version = 3");
     store.db.close();
     store = new Store(dir);
     const row = store.prep(`SELECT preview, thread_id, envelope FROM email_cache WHERE uid = 7`).get() as Record<string, unknown>;
     expect(row).toMatchObject({ preview: null, thread_id: "T1" });
     expect(row.envelope).toBeTruthy();
     expect(store.getState(1, "email")).toBeGreaterThan(before);
-    expect(store.db.pragma("user_version", { simple: true })).toBe(3);
+    expect(store.db.pragma("user_version", { simple: true })).toBe(4);
     // The next read computes the preview again and caches it.
     const got = await fetchEmailsBatch(server(leaf("1", HTML), { "1": HTML }), account, mailbox, [7], {}, store);
     expect(got.get(7)!.preview).toBe(htmlPreview(NEWSLETTER));

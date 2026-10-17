@@ -166,7 +166,7 @@ export function stripLeadingCss(text: string): string {
       rest = rest.slice(rest.startsWith("-->") ? 3 : 4).trimStart();
       continue;
     }
-    if (!AT_RULE.test(rest) && !SELECTOR.test(rest)) return rest;
+    if (!AT_RULE.test(rest) && !(SELECTOR.test(rest) && isSelector(rest.slice(0, rest.indexOf("{"))))) return rest;
     const brace = rest.indexOf("{");
     const semicolon = rest.indexOf(";");
     if (/^@(?:import|charset|namespace)\b/.test(rest) && semicolon >= 0 && (brace < 0 || semicolon < brace)) {
@@ -193,16 +193,144 @@ export function stripLeadingCss(text: string): string {
   return rest;
 }
 
+// CSS properties, for telling a style rule left in the text ("p { margin: 0 }")
+// from prose in braces ("at {time}", "{date: Monday}").
+const CSS_PROPERTY =
+  /^(?:(?:mso|-webkit|-moz|-ms|-o)-[a-z-]+|color|background(?:-[a-z]+)*|border(?:-[a-z]+)*|margin(?:-[a-z]+)?|padding(?:-[a-z]+)?|font(?:-[a-z]+)?|text-[a-z-]+|line-height|letter-spacing|word-(?:spacing|break|wrap)|white-space|(?:max-|min-)?(?:width|height)|display|visibility|opacity|overflow(?:-[xy])?|float|clear|position|top|right|bottom|left|z-index|vertical-align|list-style(?:-[a-z]+)?|outline(?:-[a-z]+)?|box-[a-z]+|cursor|content|table-layout|direction|transition(?:-[a-z]+)?|transform(?:-[a-z]+)?|animation(?:-[a-z]+)?|flex(?:-[a-z]+)?|justify-content|align-[a-z]+|gap|src|unicode-range|zoom|filter|fill|stroke|object-fit|aspect-ratio|interpolation-mode|-?[a-z]+-(?:size-adjust|text-size-adjust))$/i;
+// Element names that, bare, can be a selector ("td p { … }").
+const SELECTOR_ELEMENTS = new Set([
+  "html", "body", "table", "tbody", "thead", "tr", "td", "th", "div", "span", "p", "a", "img", "ul", "ol", "li",
+  "h1", "h2", "h3", "h4", "h5", "h6", "b", "i", "u", "strong", "em", "font", "center", "small", "sup", "sub",
+  "blockquote", "pre", "code", "hr", "br", "button", "input", "u", "o:p", "*",
+]);
+const SELECTOR_TOKEN = /^(?:[a-z*][\w-]*|[.#][\w-]+|\[[^\]]*\])?(?:[.#][\w-]+|:{1,2}[\w-]+(?:\([^)]*\))?|\[[^\]]*\])*$/i;
+
+// One whitespace-separated part of a selector: a combinator, or a compound
+// selector; a bare word only when it is an element name.
+function isSelectorToken(token: string): boolean {
+  const t = token.replace(/,$/, "");
+  if (t === "" || /^[>+~]$/.test(t)) return token !== "";
+  if (!SELECTOR_TOKEN.test(t)) return false;
+  return !/^[a-z][\w-]*$/i.test(t) || SELECTOR_ELEMENTS.has(t.toLowerCase());
+}
+
+// Every whitespace-separated token is a selector part ("td.x", ".a > p", "a:hover,").
+function isSelector(text: string): boolean {
+  const tokens = text.trim().split(/\s+/).filter(Boolean);
+  return tokens.length > 0 && tokens.every(isSelectorToken);
+}
+
+function isDeclarations(block: string): boolean {
+  const items = block.split(";").map((d) => d.trim()).filter(Boolean);
+  return items.length > 0 && items.every((d) => {
+    const m = /^([-a-z]+)\s*:\s*\S/i.exec(d);
+    return m !== null && CSS_PROPERTY.test(m[1]!);
+  });
+}
+
+function startsWithDeclaration(block: string): boolean {
+  const m = /^\s*([-a-z]+)\s*:/i.exec(block);
+  return m !== null && CSS_PROPERTY.test(m[1]!);
+}
+
+function isRuleList(block: string): boolean {
+  // The body of @media etc.: one or more `selector { declarations }`.
+  const rules = block.match(/[^{}]+\{[^{}]*\}/g);
+  if (!rules || rules.join("").replace(/\s+/g, "") !== block.replace(/\s+/g, "")) return false;
+  return rules.every((r) => isDeclarations(r.slice(r.indexOf("{") + 1, -1)));
+}
+
+function matchBrace(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === "{") depth++;
+    else if (text[i] === "}" && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * Removes CSS rules anywhere in a text: `selector { known-property: value }`
+ * and `@media … { rules }`. A rule the text ends inside of is cut off with
+ * the rest of the text.
+ */
+export function stripCssRules(text: string): string {
+  let out = text;
+  for (let from = 0, guard = 0; guard < 500; guard++) {
+    const open = out.indexOf("{", from);
+    if (open < 0) break;
+    const close = matchBrace(out, open);
+    const block = out.slice(open + 1, close < 0 ? undefined : close);
+    // What precedes the brace: an at-rule prelude, or selector tokens.
+    const before = out.slice(Math.max(0, open - 300), open);
+    const at = /@(?:media|supports|font-face|page|keyframes|-webkit-keyframes|document)\b[^{}@]*$/i.exec(before);
+    let start = -1;
+    const isRule = close < 0 ? startsWithDeclaration(block) : isDeclarations(block);
+    if (at) {
+      const ok = close < 0 || (/^@(?:font-face|page)/i.test(at[0]) ? isDeclarations(block) : isRuleList(block));
+      if (ok) start = open - (before.length - at.index);
+    } else if (isRule) {
+      const tokens = before.split(/(\s+)/);
+      let taken = 0;
+      let consumed = 0;
+      for (let i = tokens.length - 1; i >= 0; i--) {
+        const t = tokens[i]!;
+        if (t === "" || /^\s+$/.test(t)) {
+          consumed += t.length;
+          continue;
+        }
+        if (isSelectorToken(t)) {
+          consumed += t.length;
+          taken++;
+          continue;
+        }
+        break;
+      }
+      if (taken > 0) start = open - consumed;
+    }
+    if (start < 0) {
+      from = open + 1;
+      continue;
+    }
+    if (close < 0) return out.slice(0, start);
+    out = out.slice(0, start) + " " + out.slice(close + 1);
+    from = start + 1;
+  }
+  return out;
+}
+
+// Markup in a text/plain part: a converter that left tags or entity
+// references in. Only real element names count, so "<https://…>" and
+// "<name@example.com>" stay.
+const PLAIN_TAG =
+  /<\/?(?:a|abbr|b|big|blockquote|br|center|code|div|em|font|h[1-6]|hr|i|img|li|o:p|ol|p|pre|small|span|strong|sub|sup|table|tbody|td|th|thead|tr|u|ul)(?:\s[^<>]*)?\/?>/gi;
+const ENTITY = /&(?:#\d{1,7}|#x[0-9a-f]{1,6}|[a-z][a-z0-9]{1,31});/gi;
+
+function decodeEntity(ref: string): string {
+  let out = "";
+  const p = new Parser({ ontext(t) { out += t; } }, { decodeEntities: true });
+  p.write(ref);
+  p.end();
+  return out;
+}
+
+function stripPlainMarkup(text: string): string {
+  return text
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, " ")
+    .replace(PLAIN_TAG, (tag) => (/^<\/?(?:a|abbr|b|big|code|em|font|i|o:p|small|span|strong|sub|sup|u)\b/i.test(tag) ? "" : " "))
+    .replace(ENTITY, decodeEntity);
+}
+
 /** Preview of a text/plain part (or a prefix of one). */
 export function plainPreview(text: string): string {
   if (looksLikeHtml(text)) return htmlPreview(text);
-  return cut(tidy(stripLeadingCss(tidy(text))));
+  return cut(tidy(stripCssRules(stripLeadingCss(tidy(stripPlainMarkup(text))))));
 }
 
 /** Preview of a text/html part (or a prefix of one). */
 export function htmlPreview(html: string): string {
   // A converter's leftover style sheet can sit in the body text as well.
-  return cut(tidy(stripLeadingCss(htmlToText(html))));
+  return cut(tidy(stripCssRules(stripLeadingCss(htmlToText(html)))));
 }
 
 export function buildPreview(text: string, isHtml: boolean): string {
