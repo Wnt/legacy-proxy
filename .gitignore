@@ -9,3 +9,5 @@ vendor/jmap-test-suite/
 test/compliance/report.json
 
 providers.json
+__pycache__/
+*.pyc
