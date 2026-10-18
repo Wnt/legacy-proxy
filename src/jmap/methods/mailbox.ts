@@ -1,3 +1,4 @@
+import { abortable } from "../../imap/abort.js";
 import type { ImapFlow } from "imapflow";
 import type { AccountRow, Store } from "../../state/store.js";
 import { inferRole } from "../../mapping/mailboxRoles.js";
@@ -71,7 +72,8 @@ export async function listMailboxes(
   client: ImapFlow,
   account: AccountRow,
   store: Store,
-  opts: { force?: boolean } = {},
+  // `signal`: a LIST the server does not answer is cut off (abortable).
+  opts: { force?: boolean; signal?: AbortSignal } = {},
 ): Promise<MailboxJson[]> {
   if (!opts.force) {
     const cached = listCache.get(account.id);
@@ -81,9 +83,9 @@ export async function listMailboxes(
       if (fresh && stateMatch) return cached.list;
     }
   }
-  const list = await client.list({
-    statusQuery: { messages: true, unseen: true, uidNext: true, uidValidity: true },
-  });
+  const list = await abortable(client, opts.signal, () =>
+    client.list({ statusQuery: { messages: true, unseen: true, uidNext: true, uidValidity: true } }),
+  );
   const statusByPath = new Map<string, LiveMailboxStatus>();
   for (const it of list) {
     const st = it.status;

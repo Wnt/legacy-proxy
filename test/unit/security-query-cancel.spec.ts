@@ -133,10 +133,10 @@ describe("query budgets", () => {
     expect(errorOf((await h.jmap([q([{ property: "subject", isAscending: true }])], { budgets: budget() }))[0]!)).toMatchObject({
       type: "requestTooLarge",
     });
-    // Two queries that each fit alone, in one request.
+    // Two queries that each fit alone, in one request (independent reads run
+    // side by side, so either may be the one over).
     const both = await h.jmap([q(sort), q(sort)], { budgets: budget() });
-    expect(errorOf(both[0]!)).toBeNull();
-    expect(errorOf(both[1]!)).toMatchObject({ type: "requestTooLarge" });
+    expect(both.map((r) => errorOf(r)?.type ?? "ok").sort()).toEqual(["ok", "requestTooLarge"]);
   }, 30_000);
 
   it("size and keyword sorts fetch no envelopes; subject sorts do", async () => {
@@ -411,4 +411,156 @@ describe("joined full-text searches", () => {
     await until(() => g.conns.every((c) => imap.closedConns.has(c)), "the slices to be cut off", 5000);
     await until(() => inflightSearchCount() === 0, "the search to end", 5000);
   }, 60_000);
+});
+
+describe("review round 1: variants and failure paths", () => {
+  // Three invented messages in a folder, plus an empty INBOX.
+  async function small(n = 3) {
+    const imap = new FakeImapServer([{ name: "INBOX" }, { name: "Archive" }]);
+    for (let i = 0; i < n; i++) imap.add("Archive", { subject: `Quorvex ${i} ${"z".repeat(200)}`, body: "quorvex", date: daysAgo(i + 1) });
+    h = await startHarness(imap);
+    const mb = await h.mailboxIds();
+    imap.reset();
+    return { imap, mb };
+  }
+  const settles = (p: Promise<unknown>) => {
+    const s = { done: false };
+    p.finally(() => (s.done = true)).catch(() => {});
+    return s;
+  };
+
+  it("an abandoned query stops in the account's LIST-STATUS and in a stale connection's NOOP", async () => {
+    const { imap, mb } = await small();
+    let g = gate(imap, / LIST /i);
+    let ac = new AbortController();
+    let p = h!.jmap([["Email/query", { accountId: h!.accountId, filter: { from: "x" }, calculateTotal: true }, "q"]], { signal: ac.signal });
+    let s = settles(p);
+    await until(() => g.held() > 0, "the LIST");
+    ac.abort();
+    await until(() => s.done, "the query to stop", 2000);
+    expect(imap.closedConns.has(g.conns[0]!)).toBe(true);
+    g.open();
+
+    // A pooled connection again; a state change makes its next borrower NOOP it first.
+    await h!.call("Email/query", { filter: { inMailbox: mb.Archive } });
+    h!.store.bumpState(h!.account.id, "email");
+    g = gate(imap, / NOOP/i);
+    ac = new AbortController();
+    p = h!.jmap([["Email/query", { accountId: h!.accountId, filter: { inMailbox: mb.Archive } }, "q"]], { signal: ac.signal });
+    s = settles(p);
+    await until(() => g.held() > 0, "the NOOP");
+    ac.abort();
+    await until(() => s.done, "the query to stop", 2000);
+    g.open();
+    expect((await h!.call<{ ids: string[] }>("Email/query", { filter: { inMailbox: mb.Archive } })).ids).toHaveLength(3);
+  }, 30_000);
+
+  it("collapseThreads: an abandoned query stops waiting for the thread scan, which stops", async () => {
+    const { imap, mb } = await small();
+    const g = gate(imap, /UID FETCH .*ENVELOPE/i);
+    const ac = new AbortController();
+    const p = h!.jmap([["Email/query", { accountId: h!.accountId, filter: { inMailbox: mb.Archive }, collapseThreads: true, calculateTotal: true }, "q"]], { signal: ac.signal });
+    const s = settles(p);
+    await until(() => g.held() > 0, "the scan's FETCH");
+    ac.abort();
+    await until(() => s.done, "the query to stop", 2000);
+    expect((await p)[0]![0]).toBe("error");
+    await until(() => imap.closedConns.has(g.conns[0]!), "the scan's connection to close", 2000);
+    g.open();
+    expect((await h!.call<{ ids: string[] }>("Email/query", { filter: { inMailbox: mb.Archive }, collapseThreads: true })).ids).toHaveLength(3);
+  }, 30_000);
+
+  it("noneInThreadHaveKeyword reads only the matched threads, charges their members, and filters right", async () => {
+    const imap = new FakeImapServer([{ name: "INBOX" }, { name: "Archive" }, { name: "Sent" }]);
+    // Thread A: an INBOX mail and a flagged reply in Sent. Thread B: one INBOX mail.
+    imap.add("INBOX", { subject: "Plan A", messageId: "<a1@example.test>", date: daysAgo(3) });
+    imap.add("Sent", { subject: "Re: Plan A", messageId: "<a2@example.test>", inReplyTo: "<a1@example.test>", references: "<a1@example.test>", flags: ["\\Flagged"], date: daysAgo(2) });
+    imap.add("INBOX", { subject: "Plan B", messageId: "<b1@example.test>", date: daysAgo(1) });
+    for (let i = 0; i < 30; i++) imap.add("Archive", { subject: `Unrelated ${i}`, flags: ["\\Flagged"], date: daysAgo(100 + i) });
+    h = await startHarness(imap);
+    const mb = await h.mailboxIds();
+    const filter = { inMailbox: mb.INBOX, noneInThreadHaveKeyword: "$flagged" };
+    const r = await h.call<{ ids: string[] }>("Email/query", { filter, sort });
+    const subjects = (await h.call<{ list: { subject: string }[] }>("Email/get", { ids: r.ids, properties: ["subject"] })).list.map((e) => e.subject);
+    expect(subjects).toEqual(["Plan B"]);
+    // No FLAGS FETCH of whole folders, nor of the unrelated archive.
+    imap.reset();
+    await h.call("Email/query", { filter, sort });
+    const flagFetches = cmds(imap, "UID FETCH").filter((l) => /FLAGS/.test(l.line) && !/BODYSTRUCTURE/.test(l.line));
+    expect(flagFetches.some((l) => l.folder === "Archive" || /\b1:\*/.test(l.line))).toBe(false);
+    // The members of the matched threads count against the allowance.
+    const b = newRequestBudgets();
+    b.query.remaining = 2 * QUERY_HIT_UNITS;
+    const over = await h.jmap([["Email/query", { accountId: h.accountId, filter, sort }, "q"]], { budgets: b });
+    expect(errorOf(over[0]!)).toMatchObject({ type: "requestTooLarge" });
+  }, 30_000);
+
+  it("a spent allowance mid-FETCH retires the connection rather than pooling it with the FETCH on it", async () => {
+    const { imap, mb } = await small();
+    imap.stallAfterFirst = /UID FETCH .*ENVELOPE/i;
+    releases.push(() => imap.releaseStalled());
+    const b = newRequestBudgets();
+    // Three hits fit; the first subject key does not.
+    b.query.remaining = 3 * QUERY_HIT_UNITS + 1;
+    const r = await h!.jmap([["Email/query", { accountId: h!.accountId, filter: { inMailbox: mb.Archive }, sort: [{ property: "subject" }], calculateTotal: true }, "q"]],
+      { budgets: b });
+    expect(errorOf(r[0]!)).toMatchObject({ type: "requestTooLarge" });
+    const conn = cmds(imap, "UID FETCH").find((l) => /ENVELOPE/.test(l.line))!.conn;
+    await until(() => imap.closedConns.has(conn), "the connection to be retired", 2000);
+    imap.stallAfterFirst = null;
+    imap.releaseStalled();
+    expect((await h!.call<{ ids: string[] }>("Email/query", { filter: { inMailbox: mb.Archive }, sort: [{ property: "subject" }] })).ids).toHaveLength(3);
+  }, 30_000);
+
+  it("a spent allowance in one folder cuts off a sibling folder's stalled SEARCH", async () => {
+    const imap = new FakeImapServer([{ name: "INBOX" }, { name: "Archive" }]);
+    for (const f of ["INBOX", "Archive"]) for (let i = 0; i < 3; i++) imap.add(f, { subject: "Entry", date: daysAgo(i + 1) });
+    h = await startHarness(imap);
+    await h.mailboxIds();
+    let first = true;
+    let open!: () => void;
+    const held = new Promise<void>((r) => (open = r));
+    releases.push(open);
+    let heldConn = 0;
+    imap.commandGate = (line, conn) => {
+      if (!/UID SEARCH /i.test(line) || !first) return null;
+      first = false;
+      heldConn = conn;
+      return held;
+    };
+    const b = newRequestBudgets();
+    b.query.remaining = 1;
+    const p = h.jmap([["Email/query", { accountId: h.accountId, calculateTotal: true }, "q"]], { budgets: b });
+    const s = settles(p);
+    await until(() => heldConn > 0 && b.query.remaining < 0, "one folder over the allowance, the other stalled");
+    await until(() => s.done, "the query to answer", 2000);
+    expect(errorOf((await p)[0]!)).toMatchObject({ type: "requestTooLarge" });
+    expect(imap.closedConns.has(heldConn)).toBe(true);
+  }, 30_000);
+
+  it("a search that finishes while nobody waits is filed for the retry", async () => {
+    const { imap, mb } = await small();
+    setSharedSearchGraceMs(5_000);
+    const g = gate(imap, /UID SEARCH .*TEXT/i);
+    const ac = new AbortController();
+    const args = { filter: { operator: "AND", conditions: [{ inMailbox: mb.Archive }, { text: "quorvex" }] }, calculateTotal: true };
+    const p = h!.jmap([["Email/query", { accountId: h!.accountId, ...args }, "q"]], { signal: ac.signal });
+    await until(() => g.held() > 0, "the SEARCH");
+    ac.abort();
+    g.open();
+    await p;
+    await until(() => inflightSearchCount() === 0, "the search to end");
+    expect((await h!.call<{ ids: string[] }>("Email/query", args)).ids).toHaveLength(3);
+    expect(cmds(imap, "UID SEARCH")).toHaveLength(1);
+  }, 30_000);
+
+  it("hits are charged once when a cached result lacks the dates and the folder is scanned", async () => {
+    await small();
+    // A subject sort files the folder's result without caching the dates.
+    await h!.call("Email/query", { calculateTotal: true, sort: [{ property: "subject" }] });
+    const b = newRequestBudgets();
+    b.query.remaining = 3 * QUERY_HIT_UNITS;
+    const r = await h!.jmap([["Email/query", { accountId: h!.accountId, calculateTotal: true }, "q"]], { budgets: b });
+    expect(r[0]![0]).toBe("Email/query");
+  }, 30_000);
 });

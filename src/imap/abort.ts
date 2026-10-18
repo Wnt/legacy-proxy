@@ -29,21 +29,26 @@ export function checkAborted(signal: AbortSignal | undefined): void {
  * this returns, nothing of `op` still runs on the connection. A result `op`
  * returns after that is dropped too: imapflow answers some commands cut off
  * by the close with an empty value rather than an error.
+ *
+ * A spent allowance (BudgetExceededError) thrown while `op` reads a command's
+ * results leaves that command running: leaving imapflow's FETCH iterator
+ * neither cancels nor awaits the FETCH. The connection is closed then too,
+ * so it is never handed back to the pool with the command still on it.
  */
 export async function abortable<T>(client: ImapFlow, signal: AbortSignal | undefined, op: () => Promise<T>): Promise<T> {
-  if (!signal) return op();
   checkAborted(signal);
   const onAbort = () => client.close();
-  signal.addEventListener("abort", onAbort, { once: true });
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
     const result = await op();
     checkAborted(signal);
     return result;
   } catch (e) {
+    if (e instanceof BudgetExceededError || signal?.aborted) client.close();
     // The close (or the cancellation itself) is what ended `op`.
-    if (signal.aborted) throw e instanceof RequestAbortedError ? e : new RequestAbortedError();
+    if (signal?.aborted) throw e instanceof RequestAbortedError ? e : new RequestAbortedError();
     throw e;
   } finally {
-    signal.removeEventListener("abort", onAbort);
+    signal?.removeEventListener("abort", onAbort);
   }
 }

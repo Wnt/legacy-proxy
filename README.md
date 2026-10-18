@@ -188,13 +188,22 @@ Changes from upstream:
     off by closing that connection (the read stream is destroyed too), so a
     server that stopped answering no longer holds the request; this covers
     Email/query, Email/get, blob reads for drafts and the download route
-    before it streams. A full-text search joined by several requests runs on
-    while any of them waits; when the last one leaves it keeps running for
+    before it streams, the account's LIST and LIST-STATUS, a pooled
+    connection's NOOP and a new connection's login. A spent allowance also
+    retires the connection whose FETCH it interrupted (imapflow neither
+    cancels nor awaits a FETCH whose iterator is left), and in an
+    account-wide query cuts off the other folders' running commands. Work
+    several requests wait for (a full-text search, the LIST-STATUS, the
+    thread rows' scan) runs on while any of them waits and files its own
+    result; a full-text search nobody waits for any more keeps running for
     10 s, for a client that asks again after its proxy gave up, and is then
-    stopped. The in-memory SEARCH caches hold at most 2 million UIDs each.
-    Code: `src/imap/abort.ts`, `src/imap/pool.ts`,
-    `src/jmap/methods/email.ts`, `src/jmap/blobs.ts`, `src/server.ts`,
-    `src/util/concurrency.ts`. Tests:
+    stopped. `noneInThreadHaveKeyword` reads only the matched threads'
+    members and their flags (charged per member), not every message's flags
+    in the account, and the thread scan reads new mail in ranges of 4,096
+    UIDs. The in-memory SEARCH caches hold at most 2 million UIDs each.
+    Code: `src/imap/abort.ts`, `src/imap/pool.ts`, `src/util/shared.ts`,
+    `src/jmap/methods/email.ts`, `src/jmap/methods/threads.ts`,
+    `src/jmap/blobs.ts`, `src/server.ts`, `src/util/concurrency.ts`. Tests:
     `test/unit/security-query-cancel.spec.ts`.
   - *Session tokens are schema-checked.* A signed payload must have non-empty
     string `accountSlug` and `username`, integer `iat` and `exp`, `exp` in the

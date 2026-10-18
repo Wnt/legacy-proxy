@@ -20,6 +20,7 @@ import {
   type RequestBudgets,
 } from "../../imap/fetcher.js";
 import { abortable, RequestAbortedError } from "../../imap/abort.js";
+import { joinShared, sharedWaiters, type SharedTasks } from "../../util/shared.js";
 import { selectedUidValidity, withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
@@ -28,7 +29,7 @@ import { listMailboxes, refreshMailboxCounts } from "./mailbox.js";
 import { log } from "../../util/log.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
 import { headersToEmailHeaders, projectHeaderProp } from "../../imap/headers.js";
-import { buildThreadIndex, syncThreadRows, threadIdsOf } from "./threads.js";
+import { syncThreadRows, threadIdsOf } from "./threads.js";
 import { keywordToFlag } from "../../mapping/flags.js";
 import {
   buildRfc822,
@@ -384,31 +385,7 @@ async function queryEmails(args: EmailQueryArgs, ctx: QueryCtx): Promise<EmailQu
   }
 
   const noneKw = findNoneInThreadHaveKeyword(filter);
-  if (noneKw) {
-    // Flags are mutable, so the index only carries them on request — this
-    // filter is the one consumer that needs them.
-    const indexed = await buildThreadIndex(ctx, { withFlags: true });
-    let imapFlag: string;
-    try {
-      imapFlag = keywordToFlag(noneKw);
-    } catch {
-      imapFlag = noneKw;
-    }
-    const threadHasKeyword = new Map<string, boolean>();
-    for (const [tid, members] of indexed.members) {
-      let any = false;
-      for (const eid of members) {
-        const flags = indexed.flagsByEmail.get(eid);
-        if (flags && flags.has(imapFlag)) { any = true; break; }
-      }
-      threadHasKeyword.set(tid, any);
-    }
-    orderedIds = orderedIds.filter((id) => {
-      const tid = indexed.byEmail.get(id);
-      if (!tid) return true; // unknown thread → don't drop
-      return !threadHasKeyword.get(tid);
-    });
-  }
+  if (noneKw) orderedIds = await dropThreadsWithKeyword(ctx, orderedIds, noneKw);
 
   if (args.collapseThreads === true) {
     orderedIds = await collapseByThread(ctx, orderedIds);
@@ -430,8 +407,8 @@ async function queryEmails(args: EmailQueryArgs, ctx: QueryCtx): Promise<EmailQu
 // The newest id of each thread, in the given order. Only the matched ids'
 // threads matter: look those up, rather than load the whole account's thread
 // index (seconds on a 100k-message account).
-async function collapseByThread(ctx: MailCtx, ids: string[]): Promise<string[]> {
-  await syncThreadRows(ctx);
+async function collapseByThread(ctx: QueryCtx, ids: string[]): Promise<string[]> {
+  await syncThreadRows(ctx, ctx.budgets.signal);
   const threadOf = threadIdsOf(ctx.store, ctx.account.id, ids);
   const seen = new Set<string>();
   const dedup: string[] = [];
@@ -442,6 +419,65 @@ async function collapseByThread(ctx: MailCtx, ids: string[]): Promise<string[]> 
     dedup.push(id);
   }
   return dedup;
+}
+
+// noneInThreadHaveKeyword (RFC 8621 §4.4.4): drop the ids whose thread has a
+// message with the keyword. Only the threads of the ids at hand are read: their
+// members from the thread rows, then those members' flags (flags are mutable,
+// so they are FETCHed), folder by folder. Members are charged to the query's
+// allowance, and the FETCHes stop with the request. (This used to build the
+// whole account's thread index with every message's flags, whatever matched.)
+async function dropThreadsWithKeyword(ctx: QueryCtx, ids: string[], keyword: string): Promise<string[]> {
+  if (ids.length === 0) return ids;
+  const signal = ctx.budgets.signal;
+  let imapFlag: string;
+  try {
+    imapFlag = keywordToFlag(keyword);
+  } catch {
+    imapFlag = keyword;
+  }
+  await syncThreadRows(ctx, signal);
+  const threadOf = threadIdsOf(ctx.store, ctx.account.id, ids);
+  const groups = new Map<string, { mailboxIdx: number; uidvalidity: number; threadByUid: Map<number, string> }>();
+  for (const tid of new Set(threadOf.values())) {
+    const members = ctx.store.getThreadMembers(ctx.account.id, tid);
+    chargeQuery(ctx.budgets, members.length * QUERY_HIT_UNITS);
+    for (const r of members) {
+      const key = `${r.mailbox_id}:${r.uidvalidity}`;
+      let g = groups.get(key);
+      if (!g) {
+        g = { mailboxIdx: r.mailbox_id, uidvalidity: r.uidvalidity, threadByUid: new Map() };
+        groups.set(key, g);
+      }
+      g.threadByUid.set(r.uid, tid);
+    }
+  }
+  const withKeyword = new Set<string>();
+  for (const g of groups.values()) {
+    const uids = [...g.threadByUid].filter(([, tid]) => !withKeyword.has(tid)).map(([uid]) => uid);
+    if (uids.length === 0) continue;
+    const row = ctx.store
+      .prep(`SELECT name FROM mailbox WHERE id = ? AND account_id = ?`)
+      .get(g.mailboxIdx, ctx.account.id) as { name: string } | undefined;
+    if (!row) continue;
+    try {
+      await withMailbox(ctx.client, row.name, async () => {
+        if (!isCurrentEpoch(ctx.client, g.uidvalidity)) return;
+        await abortable(ctx.client, signal, async () => {
+          for await (const msg of fetchByUid(ctx.client, uids, { uid: true, flags: true })) {
+            checkAborted(signal);
+            const tid = msg.uid == null ? undefined : g.threadByUid.get(msg.uid);
+            if (tid && msg.flags?.has(imapFlag)) withKeyword.add(tid);
+          }
+        });
+      }, signal);
+    } catch (e) {
+      if (e instanceof BudgetExceededError) throw e;
+      // A folder we can't open: its members count as without the keyword.
+    }
+  }
+  // An id without a recorded thread is kept.
+  return ids.filter((id) => !withKeyword.has(threadOf.get(id) ?? ""));
 }
 
 // Full-text search, newest first, in date windows.
@@ -533,6 +569,7 @@ async function searchUidsInSlices(
   uidvalidity: number,
   query: ImapSearch,
   status: { exists?: number; uidNext?: number } | null | object,
+  file: (uids: number[]) => void,
 ): Promise<number[] | null> {
   const pool = ctx.pool;
   const st = (status ?? {}) as { exists?: number; uidNext?: number };
@@ -558,7 +595,7 @@ async function searchUidsInSlices(
     return [...all].sort((a, b) => a - b);
   };
   try {
-    return await sharedSearch(`${searchKey(ctx.account.id, path, uidvalidity, query)}|slices:${n}`, run, ctx.budgets.signal);
+    return await sharedSearch(`${searchKey(ctx.account.id, path, uidvalidity, query)}|slices:${n}`, run, file, ctx.budgets.signal);
   } catch (e) {
     // The request was abandoned: no search in one go either.
     if (e instanceof BudgetExceededError) throw e;
@@ -574,20 +611,14 @@ async function searchUidsInSlices(
 // reading every message a second time, competing with it for the same
 // connections.
 //
-// Each request waiting for a search is counted. One that is abandoned stops
-// waiting at once, and the search runs on for the others. When nobody waits
-// any more it still runs for a short grace: a client whose proxy gave up on a
-// long search asks again at once, and finds it still running (or its result
-// filed). Past the grace it is stopped: its queued slices never start and the
-// SEARCHes still running are cut off (abortable).
-interface SharedSearch {
-  promise: Promise<number[]>;
-  stop: AbortController;
-  waiters: number;
-  settled: boolean;
-  idle?: ReturnType<typeof setTimeout>;
-}
-const inflightSearches = new Map<string, SharedSearch>();
+// Each request waiting for a search is counted (joinShared). One that is
+// abandoned stops waiting at once, and the search runs on for the others.
+// When nobody waits any more it still runs for a short grace: a client whose
+// proxy gave up on a long search asks again at once, and finds it still
+// running or its result filed (each search files its own result, see
+// `file`). Past the grace it is stopped: its queued slices never start and
+// the SEARCHes still running are cut off (abortable).
+const inflightSearches: SharedTasks<number[]> = new Map();
 let sharedSearchGraceMs = 10_000;
 
 /** The grace an unwatched search keeps running for (tests). */
@@ -600,82 +631,24 @@ function searchKey(accountId: number, path: string, uidvalidity: number, query: 
 }
 
 /**
- * Wait for the search `key`, starting it with `run` if none is running.
- * `onCallerConnection`: `run` uses the caller's own connection (which is busy
- * with it until it settles). A caller that started such a search waits for it
- * to settle even when its own request is abandoned, then throws; it never
- * hands back a connection with the search still on it.
+ * Wait for the full-text search `key`, starting it with `run` if none runs.
+ * `file` caches the result; the search calls it itself as soon as it has the
+ * result, whether or not anyone still waits. `onCallerConnection`: `run`
+ * SEARCHes on the caller's own connection (see joinShared).
  */
 function sharedSearch(
   key: string,
-  run: (signal: AbortSignal) => Promise<number[]>,
+  run: (stop: AbortSignal) => Promise<number[]>,
+  file: (uids: number[]) => void,
   signal: AbortSignal | undefined,
   onCallerConnection = false,
 ): Promise<number[]> {
-  checkAborted(signal);
-  let s = inflightSearches.get(key);
-  const started = !s;
-  if (!s) {
-    const entry: SharedSearch = { promise: null as never, stop: new AbortController(), waiters: 0, settled: false };
-    entry.promise = run(entry.stop.signal).finally(() => {
-      entry.settled = true;
-      clearTimeout(entry.idle);
-      if (inflightSearches.get(key) === entry) inflightSearches.delete(key);
-    });
-    // Every waiter handles the outcome; one that left must not leave it unhandled.
-    entry.promise.catch(() => {});
-    inflightSearches.set(key, entry);
-    s = entry;
-  }
-  const entry = s;
-  entry.waiters++;
-  clearTimeout(entry.idle);
-  entry.idle = undefined;
-  let left = false;
-  const leave = () => {
-    if (left) return;
-    left = true;
-    if (--entry.waiters > 0 || entry.settled) return;
-    entry.idle = setTimeout(() => {
-      if (entry.waiters > 0 || entry.settled) return;
-      // A later identical search starts afresh rather than joining this one.
-      if (inflightSearches.get(key) === entry) inflightSearches.delete(key);
-      entry.stop.abort();
-    }, sharedSearchGraceMs);
-    entry.idle.unref?.();
+  const search = async (stop: AbortSignal) => {
+    const uids = await run(stop);
+    file(uids);
+    return uids;
   };
-  if (!signal) return entry.promise.finally(leave);
-  if (started && onCallerConnection) {
-    signal.addEventListener("abort", leave, { once: true });
-    return entry.promise
-      .finally(() => {
-        signal.removeEventListener("abort", leave);
-        leave();
-      })
-      .then((uids) => {
-        checkAborted(signal);
-        return uids;
-      });
-  }
-  return new Promise<number[]>((resolve, reject) => {
-    const onAbort = () => {
-      leave();
-      reject(new RequestAbortedError());
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    entry.promise.then(
-      (uids) => {
-        signal.removeEventListener("abort", onAbort);
-        leave();
-        resolve(uids);
-      },
-      (e: unknown) => {
-        signal.removeEventListener("abort", onAbort);
-        leave();
-        reject(e);
-      },
-    );
-  });
+  return joinShared(inflightSearches, key, search, signal, { onCallerConnection, graceMs: sharedSearchGraceMs });
 }
 
 /** In-flight full-text SEARCHes (tests). */
@@ -685,9 +658,7 @@ export function inflightSearchCount(): number {
 
 /** Requests waiting for in-flight full-text SEARCHes, over all of them (tests). */
 export function sharedSearchWaiters(): number {
-  let n = 0;
-  for (const s of inflightSearches.values()) n += s.waiters;
-  return n;
+  return sharedWaiters(inflightSearches);
 }
 
 /** `n` UID ranges that together cover 1:* (the last one is open-ended). */
@@ -828,7 +799,8 @@ async function fetchSortMetadata(
       if (fields?.flags && msg.flags) meta.flags = new Set(msg.flags);
       let units = (meta.from?.length ?? 0) + (meta.to?.length ?? 0) + (meta.subject?.length ?? 0);
       for (const f of meta.flags ?? []) units += f.length + 16;
-      if (units > 0) chargeQuery(budgets, units);
+      // Also with nothing to charge: another worker may have spent it.
+      chargeQuery(budgets, units);
       out.set(uid, meta);
     }
   });
@@ -1004,8 +976,10 @@ async function emailQuerySingleMailboxFull(
     }
     if (!uids) {
       const query = windowedSearch(imapFilter, window);
+      const file = (found: number[]) =>
+        rememberSearch(cacheKey, { uids: found, modseq, emailState, expiresAt: Date.now() + SEARCH_CACHE_TTL_MS });
       const sliced = hasFullTextTerm(filter)
-        ? await searchUidsInSlices(ctx, mboxRow.name, uidvalidity, query, status)
+        ? await searchUidsInSlices(ctx, mboxRow.name, uidvalidity, query, status, file)
         : null;
       if (sliced) {
         uids = sliced;
@@ -1014,15 +988,10 @@ async function emailQuerySingleMailboxFull(
         // waits for it any more (sharedSearch), any other with the request.
         const search = (stop: AbortSignal | undefined) => abortable(ctx.client, stop, () => searchUids(ctx.client, query));
         uids = hasFullTextTerm(filter)
-          ? await sharedSearch(searchKey(ctx.account.id, mboxRow.name, uidvalidity, query), search, signal, true)
+          ? await sharedSearch(searchKey(ctx.account.id, mboxRow.name, uidvalidity, query), search, file, signal, true)
           : await search(signal);
       }
-      rememberSearch(cacheKey, {
-        uids,
-        modseq,
-        emailState,
-        expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
-      });
+      file(uids);
     }
     // Every hit the result holds before its page is cut.
     chargeQuery(ctx.budgets, uids.length * QUERY_HIT_UNITS);
@@ -1101,7 +1070,9 @@ interface FolderSnapshot {
   byPath: Map<string, FolderStatus>;
 }
 const folderSnapshots = new Map<number, FolderSnapshot>();
-const folderSnapshotInflight = new Map<number, Promise<FolderSnapshot>>();
+// The LIST-STATUS running per account, shared by the queries waiting for it
+// (joinShared): on the first one's connection, cut off when none waits.
+const folderSnapshotTasks: SharedTasks<FolderSnapshot> = new Map();
 // How long one LIST-STATUS answers for, while the account's state stays put.
 const FOLDER_SNAPSHOT_TTL_MS = 5_000;
 
@@ -1114,42 +1085,39 @@ const FOLDER_SEARCH_CACHE_MAX = 4096;
 const FOLDER_SEARCH_CACHE_MAX_UIDS = 2_000_000;
 let folderSearchCacheUids = 0;
 
-async function folderSnapshot(ctx: MailCtx, emailState: number): Promise<FolderSnapshot | null> {
+async function folderSnapshot(ctx: QueryCtx, emailState: number): Promise<FolderSnapshot | null> {
   const id = ctx.account.id;
   const cur = folderSnapshots.get(id);
   if (cur && cur.emailState === emailState && Date.now() - cur.at < FOLDER_SNAPSHOT_TTL_MS) return cur;
-  let running = folderSnapshotInflight.get(id);
-  if (!running) {
-    running = (async () => {
-      const at = Date.now();
-      const list = await ctx.client.list({
-        statusQuery: { messages: true, uidNext: true, uidValidity: true, highestModseq: true },
+  const read = async (stop: AbortSignal): Promise<FolderSnapshot> => {
+    const at = Date.now();
+    const list = await abortable(ctx.client, stop, () =>
+      ctx.client.list({ statusQuery: { messages: true, uidNext: true, uidValidity: true, highestModseq: true } }),
+    );
+    const byPath = new Map<string, FolderStatus>();
+    for (const it of list) {
+      const st = it.status as
+        | { messages?: number; uidNext?: number; uidValidity?: number | bigint; highestModseq?: number | bigint }
+        | undefined;
+      if (st?.uidNext == null || st.uidValidity == null || st.messages == null || st.highestModseq == null) continue;
+      byPath.set(it.path, {
+        uidValidity: Number(st.uidValidity),
+        uidNext: Number(st.uidNext),
+        messages: st.messages,
+        modseq: String(st.highestModseq),
       });
-      const byPath = new Map<string, FolderStatus>();
-      for (const it of list) {
-        const st = it.status as
-          | { messages?: number; uidNext?: number; uidValidity?: number | bigint; highestModseq?: number | bigint }
-          | undefined;
-        if (st?.uidNext == null || st.uidValidity == null || st.messages == null || st.highestModseq == null) continue;
-        byPath.set(it.path, {
-          uidValidity: Number(st.uidValidity),
-          uidNext: Number(st.uidNext),
-          messages: st.messages,
-          modseq: String(st.highestModseq),
-        });
-      }
-      const snap = { emailState, at, byPath };
-      folderSnapshots.set(id, snap);
-      return snap;
-    })();
-    folderSnapshotInflight.set(id, running);
-    running.finally(() => folderSnapshotInflight.delete(id)).catch(() => {});
-  }
+    }
+    const snap = { emailState, at, byPath };
+    folderSnapshots.set(id, snap);
+    return snap;
+  };
   try {
-    const snap = await running;
+    const snap = await joinShared(folderSnapshotTasks, String(id), read, ctx.budgets.signal, { onCallerConnection: true, graceMs: 0 });
     // A snapshot read for an older state is no good to a newer caller.
     return snap.emailState === emailState ? snap : null;
   } catch (e) {
+    // Abandoned: the query stops, it does not go on to search every folder.
+    if (e instanceof BudgetExceededError) throw e;
     log.warn({ err: (e as Error).message }, "account-wide Email/query: LIST-STATUS failed; searching every folder");
     return null;
   }
@@ -1245,12 +1213,18 @@ async function emailQueryAccountWideFull(
     }
   }
 
-  const signal = ctx.budgets.signal;
+  // A spent allowance in one folder worker ends the query: `halt` then stops
+  // the other workers' commands and queued leases at once (abortable), as an
+  // abandoned request does, rather than letting them run to their end.
+  const halt = new AbortController();
+  const outer = ctx.budgets.signal;
+  const signal = outer ? AbortSignal.any([outer, halt.signal]) : halt.signal;
+  ctx = { ...ctx, budgets: { ...ctx.budgets, signal } };
   const fields = sortFields(sort);
   // Folders are scanned on bulk connections leased after this one, so their
   // views include at least the state this connection is at.
   const emailState = viewState(ctx, ctx.client);
-  const all = await listMailboxes(ctx.client, ctx.account, ctx.store);
+  const all = await listMailboxes(ctx.client, ctx.account, ctx.store, { signal });
   type MboxRow = { id: number; name: string; uidvalidity: number };
   const rows = ctx.store
     .prep(`SELECT id, name, uidvalidity FROM mailbox WHERE account_id = ?`)
@@ -1299,15 +1273,15 @@ async function emailQueryAccountWideFull(
     const hit = getFolderSearch(ctx.store, ctx.account.id, idx, live.uidValidity, filterHash);
     if (!hit || !sameFolderStatus(hit, live)) return null;
     if (hit.uids.length === 0) return [];
-    chargeQuery(ctx.budgets, hit.uids.length * QUERY_HIT_UNITS);
     const rows = ctx.store.getEmailCacheRows(ctx.account.id, idx, live.uidValidity, hit.uids);
-    const found: SortableHit[] = [];
+    // Every date has to be there; otherwise the folder is scanned, and its
+    // hits are charged there instead (only once).
     for (const uid of hit.uids) {
       const r = rows.get(uid);
       if (!r || !(r.internaldate > 0)) return null;
-      found.push({ mailboxIdx: idx, uidvalidity: live.uidValidity, uid, receivedAt: r.internaldate });
     }
-    return found;
+    chargeQuery(ctx.budgets, hit.uids.length * QUERY_HIT_UNITS);
+    return hit.uids.map((uid) => ({ mailboxIdx: idx, uidvalidity: live.uidValidity, uid, receivedAt: rows.get(uid)!.internaldate }));
   };
 
   const scanFolder = async (idx: number, row: MboxRow, client: ImapFlow): Promise<SortableHit[]> => {
@@ -1336,18 +1310,16 @@ async function emailQueryAccountWideFull(
       }
       if (!uids) {
         const query = windowedSearch(imapFilter, window);
+        const file = (found: number[]) => {
+          rememberSearch(cacheKey, { uids: found, modseq, emailState, expiresAt: Date.now() + SEARCH_CACHE_TTL_MS });
+          if (live && live.uidValidity === uidvalidity) putFolderSearch(ctx.store, ctx.account.id, idx, filterHash, { ...live, uids: found });
+        };
         // On this worker's connection: see the single-mailbox search.
         const search = (stop: AbortSignal | undefined) => abortable(client, stop, () => searchUids(client, query));
         uids = fullText
-          ? await sharedSearch(searchKey(ctx.account.id, row.name, uidvalidity, query), search, signal, true)
+          ? await sharedSearch(searchKey(ctx.account.id, row.name, uidvalidity, query), search, file, signal, true)
           : await search(signal);
-        rememberSearch(cacheKey, {
-          uids,
-          modseq,
-          emailState,
-          expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
-        });
-        if (live && live.uidValidity === uidvalidity) putFolderSearch(ctx.store, ctx.account.id, idx, filterHash, { ...live, uids });
+        file(uids);
       }
       if (uids.length === 0) return;
       chargeQuery(ctx.budgets, uids.length * QUERY_HIT_UNITS);
@@ -1407,12 +1379,13 @@ async function emailQueryAccountWideFull(
     const prev = getFolderSearch(ctx.store, ctx.account.id, idx, uidvalidity, filterHash);
     if (prev && sameFolderStatus(prev, live)) uids = prev.uids;
     if (!uids) {
+      const file = (found: number[]) => putFolderSearch(ctx.store, ctx.account.id, idx, filterHash, { ...live, uids: found });
       uids = await searchUidsInSlices(ctx, row.name, uidvalidity, windowedSearch(imapFilter, window), {
         exists: live.messages,
         uidNext: live.uidNext,
-      });
+      }, file);
       if (!uids) return null;
-      putFolderSearch(ctx.store, ctx.account.id, idx, filterHash, { ...live, uids });
+      file(uids);
     }
     if (uids.length === 0) return [];
     chargeQuery(ctx.budgets, uids.length * QUERY_HIT_UNITS);
@@ -1443,9 +1416,17 @@ async function emailQueryAccountWideFull(
   };
 
   // A request that is abandoned, or runs out of its allowance, stops its
-  // workers: no folder starts after that (mapWithConcurrency), and the ones
-  // running stop at their next check or command.
+  // workers: no folder starts after that (mapWithConcurrency), the ones
+  // running are cut off (`halt`), and the query answers once they unwound.
   const perFolder = await mapWithConcurrency(targets, ACCOUNT_SCAN_CONCURRENCY, async (t) => {
+    try {
+      return await scanTarget(t);
+    } catch (e) {
+      if (e instanceof BudgetExceededError && !(e instanceof RequestAbortedError)) halt.abort();
+      throw e;
+    }
+  });
+  async function scanTarget(t: { idx: number; row: MboxRow }): Promise<SortableHit[]> {
     checkAborted(signal);
     const cachedHits = cachedFolderHits(t.idx, t.row);
     if (cachedHits) return cachedHits;
@@ -1474,7 +1455,7 @@ async function emailQueryAccountWideFull(
       );
       return [] as SortableHit[];
     }
-  });
+  }
   const hits: SortableHit[] = perFolder.flat();
 
   const effectiveSort: SortSpec[] = sort.length

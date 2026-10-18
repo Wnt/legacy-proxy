@@ -7,6 +7,8 @@ import { abortable } from "./abort.js";
 export interface ImapConnOpts {
   provider: ProviderConfig;
   creds: Credentials;
+  /** Gives up the connect and login (the socket is closed) when it fires. */
+  signal?: AbortSignal;
 }
 
 // Above the largest message this proxy sends or stores (50 MB of attachments,
@@ -46,7 +48,7 @@ export async function openImap(opts: ImapConnOpts): Promise<ImapFlow> {
   client.on("error", (err: unknown) => {
     log.debug({ host: provider.imap.host, ...imapErrorDetails(err) }, "imap connection error");
   });
-  await client.connect();
+  await abortable(client, opts.signal, () => client.connect());
   log.debug({ host: provider.imap.host, mech: creds.mech }, "imap connected");
   return client;
 }

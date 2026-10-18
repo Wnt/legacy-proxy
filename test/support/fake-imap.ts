@@ -144,6 +144,15 @@ export class FakeImapServer {
   commandGate: ((line: string, conn: number) => Promise<unknown> | null) | null = null;
   /** Connections the client side closed (socket ended or destroyed), by number. */
   closedConns = new Set<number>();
+  /**
+   * A command matching this answers its first untagged response, then stalls:
+   * the rest (and the tagged completion) wait for releaseStalled().
+   */
+  stallAfterFirst: RegExp | null = null;
+  private stalled: Array<() => void> = [];
+  releaseStalled(): void {
+    for (const f of this.stalled.splice(0)) f();
+  }
   private server: net.Server | null = null;
   private sockets = new Set<net.Socket>();
   port = 0;
@@ -260,8 +269,20 @@ export class FakeImapServer {
         const full = (pending + line).replace(/\u0000([^]*?)(?=\s|\)|$)/g, (_m, v: string) => q(v));
         pending = "";
         const run = () => {
+          let out = w;
+          if (this.stallAfterFirst?.test(full)) {
+            let first = true;
+            const held: string[] = [];
+            this.stalled.push(() => held.splice(0).forEach(w));
+            out = (s: string) => {
+              if (first && s.startsWith("* ")) {
+                first = false;
+                w(s);
+              } else held.push(s);
+            };
+          }
           try {
-            this.command(full, conn, w, () => selected, (f) => (selected = f), () => sock.end());
+            this.command(full, conn, out, () => selected, (f) => (selected = f), () => sock.end());
           } catch (e) {
             const tag = full.split(" ")[0];
             w(`${tag} BAD ${(e as Error).message}\r\n`);

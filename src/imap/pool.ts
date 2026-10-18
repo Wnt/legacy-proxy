@@ -6,7 +6,7 @@ import { openCredentials } from "../auth/credentials.js";
 import { openImap } from "./client.js";
 import type { Store, AccountRow } from "../state/store.js";
 import { log } from "../util/log.js";
-import { checkAborted, RequestAbortedError } from "./abort.js";
+import { abortable, checkAborted, RequestAbortedError } from "./abort.js";
 
 interface PoolEntry {
   client: ImapFlow;
@@ -202,13 +202,22 @@ export class ImapPool {
       const stale = target.email !== entry.synced.email || target.mailbox !== entry.synced.mailbox;
       if (idleMs < NOOP_FRESHNESS_MS && !stale) return { entry };
       try {
-        await entry.client.noop();
+        // A NOOP the server does not answer is cut off when the caller's
+        // request is abandoned (the connection is closed, see abortable).
+        // imapflow answers a failed NOOP with false rather than an error.
+        const ok = await abortable(entry.client, signal, () => entry.client.noop());
+        if ((ok as unknown) === false) throw new Error("NOOP failed");
         this.markSynced(entry, target);
         return { entry };
-      } catch {
+      } catch (e) {
         // Dead despite looking usable; drop it and keep looking.
         entry.busy = false;
         this.drop(key, entry);
+        if (e instanceof RequestAbortedError) {
+          // Its slot is free again for someone else.
+          this.wake(key);
+          throw e;
+        }
       }
     }
 
@@ -225,7 +234,9 @@ export class ImapPool {
       const provider = resolveProvider(this.cfg, account.kind);
       const creds: Credentials = await openCredentials(this.cfg.vaultKey, account.vault);
       const synced = mailState(this.store, account.id);
-      const client = await openImap({ provider, creds });
+      checkAborted(signal);
+      // A login the server does not answer is given up with the request.
+      const client = await openImap({ provider, creds, signal });
       entry = { client, lastUsed: Date.now(), busy: true, synced };
       this.markSynced(entry, synced);
     } catch (e) {
