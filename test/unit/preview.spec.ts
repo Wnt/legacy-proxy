@@ -95,7 +95,7 @@ describe("plainPreview", () => {
   });
 
   it("drops CSS rules after the first words, not prose in braces", () => {
-    expect(plainPreview("View this email in your browser p { margin: 0; } .hdr td { padding:0 !important } Hello Jonni")).toBe("View this email in your browser Hello Jonni");
+    expect(plainPreview("View this email in your browser p { margin: 0; } .hdr td { padding:0 !important } Hello Alex")).toBe("View this email in your browser Hello Alex");
     expect(plainPreview("Intro text @media only screen and (max-width:600px) { .col { width:100% !important; } } Body")).toBe("Intro text Body");
     expect(plainPreview("Intro text .x { color: red; font-size: 1")).toBe("Intro text");
     expect(plainPreview("Join us {at 5pm} and bring {color: your own mug}")).toBe("Join us {at 5pm} and bring {color: your own mug}");
