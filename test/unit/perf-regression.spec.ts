@@ -365,3 +365,99 @@ describe("an INBOX open the IDLE worker vouches for asks the server nothing (inb
     inboxUnwatched(h.account.id);
   }, 30_000);
 });
+
+describe("a conversation's other copies are warmed with its new INBOX message (thread-prefetch)", () => {
+  type Worker = { closing: boolean; client: object; inbox: { uidValidity: number; uids: number[] }; queue: Promise<void> };
+  // What the IDLE worker does when it hears new INBOX mail (push/idle.ts).
+  const arrival = async (h: Harness, worker: Worker) => {
+    const idle = new PushIdleManager(h.cfg, h.store, h.pool);
+    await (idle as unknown as { syncInbox(a: unknown, w: unknown, c: unknown, k: string): Promise<void> })
+      .syncInbox(h.account, worker, worker.client, "arrival");
+  };
+  const inboxWorker = (uids: number[]): Worker => ({ closing: false, client: {}, inbox: { uidValidity: 1, uids }, queue: Promise.resolve() });
+  // Bulwark's conversation open (lib/jmap/client.ts fetchThreadEmails): one request.
+  const openConversation = (h: Harness, threadId: string) => h.jmap([
+    ["Thread/get", { accountId: h.accountId, ids: [threadId] }, "t"],
+    ["Email/get", { accountId: h.accountId, "#ids": { resultOf: "t", name: "Thread/get", path: "/list/*/emailIds" }, properties: OPEN_PROPS, ...OPEN_OPTS }, "e"],
+  ]);
+  const threadOf = (h: Harness, folderIdx: number, uid: number) => h.store.getThreadIdsByUid(h.account.id, folderIdx, 1, [uid]).get(uid)!;
+  const warmedIn = (h: Harness, folder: string) => {
+    const out = new Set<number>();
+    for (const l of h.imap.log) {
+      if (l.folder !== folder || !isFetch(l) || !/BODY(\.PEEK)?\[1\]/i.test(l.line)) continue;
+      for (const r of l.line.split(" ")[3]!.split(",")) {
+        const [a, b] = r.split(":").map(Number);
+        for (let u = a!; u <= (b ?? a!); u++) out.add(u);
+      }
+    }
+    return out;
+  };
+
+  it("a message sent to oneself: the conversation open reads no message data, the Sent copy included", async () => {
+    const imap = new FakeImapServer([{ name: "INBOX" }, { name: "Sent", specialUse: "\\Sent" }]);
+    for (let i = 0; i < 3; i++) imap.add("INBOX");
+    for (let i = 0; i < 2; i++) imap.add("Sent");
+    h = await startHarness(imap);
+    const mb = await h.mailboxIds();
+    // The account's thread rows exist: Bulwark's conversation list scanned it once.
+    await h.call("Thread/get", { ids: [] });
+    // Sent: the draft moved to Sent at submission; then the delivery to INBOX.
+    imap.add("Sent", { messageId: "<self.1@example.test>", subject: "Note to self", body: "Sent copy text." });
+    const delivered = imap.add("INBOX", { messageId: "<self.1@example.test>", subject: "Note to self", body: "Inbox copy text." });
+    await arrival(h, inboxWorker([1, 2, 3]));
+    await settle(imap);
+    expectReadOnly(h);
+    const warmedSent = warmedIn(h, "Sent");
+
+    const threadId = threadOf(h, decodeMailboxId(mb.INBOX!).mailboxIdx, delivered.uid);
+    imap.reset();
+    const out = await openConversation(h, threadId);
+    const got = out[1]![1] as { list: { id: string; mailboxIds: Record<string, boolean>; bodyValues: Record<string, { value: string }> }[] };
+    expect(out[1]![0]).toBe("Email/get");
+    expect(got.list).toHaveLength(2);
+    expect(got.list.map((e) => Object.keys(e.mailboxIds)[0]).sort()).toEqual([mb.INBOX, mb.Sent].sort());
+    for (const e of got.list) expect(Object.values(e.bodyValues).map((v) => v.value.trim())).not.toEqual([]);
+    expect(bodyFetches(h)).toEqual([]);
+    expect(warmedSent).toEqual(new Set([3]));
+  }, 30_000);
+
+  it("bounded: newest SIBLINGS_MAX of a thread, long threads not followed, no first scan started", async () => {
+    const { SIBLINGS_MAX, SIBLING_THREAD_MAX } = await import("../../src/imap/prefetch.js");
+    const imap = new FakeImapServer([{ name: "INBOX" }, { name: "Sent", specialUse: "\\Sent" }, { name: "Archive", specialUse: "\\Archive" }]);
+    for (let i = 0; i < 3; i++) imap.add("INBOX");
+    // Thread A: 14 of our replies in Sent. Thread B: longer than SIBLING_THREAD_MAX, in Archive.
+    const A = "<thread-a@example.test>", B = "<thread-b@example.test>";
+    imap.add("Sent", { messageId: A });
+    for (let i = 0; i < 13; i++) imap.add("Sent", { inReplyTo: A, references: A });
+    for (let i = 0; i < SIBLING_THREAD_MAX; i++) imap.add("Archive", { inReplyTo: B, references: B });
+    h = await startHarness(imap);
+    await h.mailboxIds();
+
+    // Not scanned yet: the prefetch warms the new message only and starts no scan.
+    imap.add("INBOX", { inReplyTo: A, references: A });
+    await arrival(h, inboxWorker([1, 2, 3]));
+    await settle(imap);
+    const elsewhere = (l: CommandLog) =>
+      l.folder === "Sent" || l.folder === "Archive" || ((l.cmd === "SELECT" || l.cmd === "EXAMINE") && /Sent|Archive/.test(l.line));
+    expect(imap.log.filter(elsewhere)).toEqual([]);
+
+    // Scanned (a Thread/get ran). A reply in the long thread B: not followed.
+    await h.call("Thread/get", { ids: [] });
+    imap.add("INBOX", { inReplyTo: B, references: B });
+    imap.reset();
+    await arrival(h, inboxWorker([1, 2, 3, 4]));
+    await settle(imap);
+    expect(warmedIn(h, "Archive")).toEqual(new Set());
+    expect(imap.log.filter((l) => l.folder === "Archive")).toEqual([]);
+
+    // A reply in thread A: its newest SIBLINGS_MAX copies in Sent.
+    imap.add("INBOX", { inReplyTo: A, references: A });
+    imap.reset();
+    await arrival(h, inboxWorker([1, 2, 3, 4, 5]));
+    await settle(imap);
+    expectReadOnly(h);
+    const sent = warmedIn(h, "Sent");
+    expect(sent.size).toBe(SIBLINGS_MAX);
+    expect(Math.min(...sent)).toBe(14 - SIBLINGS_MAX + 1); // the newest
+  }, 30_000);
+});
