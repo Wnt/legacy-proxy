@@ -132,6 +132,8 @@ export class FakeImapServer {
   folders = new Map<string, FakeFolder>();
   log: CommandLog[] = [];
   connections = 0;
+  /** Like Dovecot's mail_max_userip_connections: LOGIN beyond this many open sessions is refused. */
+  maxConnections = Infinity;
   private server: net.Server | null = null;
   private sockets = new Set<net.Socket>();
   port = 0;
@@ -276,6 +278,9 @@ export class FakeImapServer {
         w("* CAPABILITY IMAP4rev1 LITERAL+ ENABLE CONDSTORE LIST-STATUS UIDPLUS\r\n");
         return ok();
       case "LOGIN":
+        if (this.sockets.size > this.maxConnections) {
+          return w(`${tag} NO [LIMIT] Maximum number of connections from user+IP exceeded\r\n`);
+        }
         return ok("[CAPABILITY IMAP4rev1 LITERAL+ ENABLE CONDSTORE LIST-STATUS UIDPLUS] logged in");
       case "ENABLE":
         w(`* ENABLED ${args.filter((a) => String(a).toUpperCase() === "CONDSTORE").join(" ")}\r\n`);

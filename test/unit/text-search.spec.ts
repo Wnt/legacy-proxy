@@ -171,3 +171,68 @@ describe("textSearchWindows", () => {
     ]);
   });
 });
+
+describe("a full-text search of a large folder runs in UID slices, in parallel", () => {
+  // Invented word; three matches spread over the folder's UID range.
+  async function bigInbox(maxConnections = Infinity) {
+    const imap = folders();
+    imap.maxConnections = maxConnections;
+    const N = 6000;
+    const at = new Set([3, 3100, 5990]);
+    for (let i = 1; i <= N; i++) {
+      imap.add(i % 7 ? "INBOX" : "Archive", {
+        subject: at.has(i) ? `Note ${i}` : `Plain ${i}`,
+        body: at.has(i) ? "Meet at the Zorblatt kiosk." : "Nothing here.",
+        date: daysAgo(3000 - i / 2),
+      });
+    }
+    h = await startHarness(imap);
+    return { imap, mb: await h.mailboxIds() };
+  }
+  const sliceSearches = (imap: FakeImapServer) => searches(imap).filter((l) => /\bUID \d+:(\d+|\*)/.test(l.line.replace(/^\S+ UID SEARCH /, "")));
+
+  it("one folder: every match, the SEARCH spread over several connections", async () => {
+    const { imap, mb } = await bigInbox();
+    imap.reset();
+    const r = await h!.call<Query>("Email/query", {
+      filter: { operator: "AND", conditions: [{ inMailbox: mb.INBOX }, { text: "zorblatt" }] },
+      sort: [{ property: "receivedAt", isAscending: false }],
+      limit: 50,
+    });
+    expect(r.ids).toHaveLength(3);
+    const sliced = sliceSearches(imap);
+    expect(sliced.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(sliced.map((l) => l.conn)).size).toBeGreaterThanOrEqual(2);
+  }, 60_000);
+
+  it("all folders: the same matches as one SEARCH per folder", async () => {
+    const { imap, mb } = await bigInbox();
+    const filter = { operator: "AND", conditions: [{ text: "ZORBLATT" }, { inMailboxOtherThan: [mb.Trash, mb.Junk] }] };
+    const sort = [{ property: "receivedAt", isAscending: false }];
+    imap.reset();
+    const r = await h!.call<Query>("Email/query", { filter, sort, limit: 50 });
+    expect(r.ids).toHaveLength(3);
+    expect(sliceSearches(imap).length).toBeGreaterThanOrEqual(2);
+    const subjects = (await h!.call<{ list: { subject: string }[] }>("Email/get", { ids: r.ids, properties: ["subject"] })).list.map((e) => e.subject);
+    expect(subjects).toEqual(["Note 5990", "Note 3100", "Note 3"]);
+  }, 60_000);
+
+  it.each([
+    ["fewer bulk connections than slices", 4, true],
+    ["no bulk connection at all", 2, false],
+  ])("a server that refuses extra connections (%s): the search still finds every match", async (_label, max, sliced) => {
+    // The request's own connection (plus the one the harness's mailbox
+    // listing may hold), then only what the limit leaves.
+    const { imap, mb } = await bigInbox(max);
+    imap.reset();
+    const r = await h!.call<Query>("Email/query", {
+      filter: { operator: "AND", conditions: [{ inMailbox: mb.INBOX }, { text: "zorblatt" }] },
+      sort: [{ property: "receivedAt", isAscending: false }],
+      limit: 50,
+    });
+    expect(r.ids).toHaveLength(3);
+    // With some bulk connections the slices queue for them; with none the
+    // folder is searched in one go on the request's own connection.
+    expect(sliceSearches(imap).length >= 2).toBe(sliced);
+  }, 60_000);
+});

@@ -320,3 +320,14 @@ describe("ImapPool wakeups", () => {
     await pool.closeAll();
   });
 });
+
+describe("isConnectionLimit", () => {
+  it("knows a connection-limit refusal from a bad login", async () => {
+    const { isConnectionLimit } = await import("../../src/imap/pool.js");
+    // imapflow's error for Dovecot's refusal at LOGIN.
+    expect(isConnectionLimit({ message: "Command failed", responseText: "Maximum number of connections from user+IP exceeded", serverResponseCode: "LIMIT" })).toBe(true);
+    expect(isConnectionLimit(new Error("Too many simultaneous connections"))).toBe(true);
+    expect(isConnectionLimit({ message: "Command failed", responseText: "Authentication failed.", serverResponseCode: "AUTHENTICATIONFAILED" })).toBe(false);
+    expect(isConnectionLimit(new Error("login failed"))).toBe(false);
+  });
+});

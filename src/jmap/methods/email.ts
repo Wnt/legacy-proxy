@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ImapFlow } from "imapflow";
 import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
-import { viewEmailState, type ImapPool } from "../../imap/pool.js";
+import { BULK_CONNECTIONS, viewEmailState, type ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
 import { encodeEmailState } from "../../state/states.js";
 import type { ParsedHeader } from "../../imap/headers.js";
@@ -483,6 +483,65 @@ function windowedSearch(imapFilter: ImapSearch, window: DateWindow | undefined):
   };
 }
 
+// A full-text SEARCH makes the server read each message it considers, at a
+// rate per connection; the server runs connections in parallel. So the SEARCH
+// of a large folder is split into UID ranges, each SEARCHed on a bulk
+// connection of its own, and the hits are joined. The ranges cover every UID,
+// so the result is the same one a single SEARCH gives.
+const SLICE_MIN_MESSAGES = 2500;
+const SLICE_MAX = BULK_CONNECTIONS;
+
+async function searchUidsInSlices(
+  ctx: MailCtx,
+  path: string,
+  uidvalidity: number,
+  query: ImapSearch,
+  status: { exists?: number; uidNext?: number } | null | object,
+): Promise<number[] | null> {
+  const pool = ctx.pool;
+  const st = (status ?? {}) as { exists?: number; uidNext?: number };
+  const messages = Number(st.exists ?? 0);
+  const uidNext = Number(st.uidNext ?? 0);
+  if (!pool || messages < SLICE_MIN_MESSAGES || uidNext < 2 || query.uid !== undefined) return null;
+  const n = Math.min(SLICE_MAX, Math.ceil(messages / SLICE_MIN_MESSAGES));
+  if (n < 2) return null;
+  const ranges = uidRanges(uidNext, n);
+  let parts: number[][];
+  try {
+    parts = await mapWithConcurrency(ranges, n, (range) =>
+      pool.withConnection(ctx.account, "bulk", (client) =>
+        withMailbox(client, path, async () => {
+          if (!isCurrentEpoch(client, uidvalidity)) throw new Error("UIDVALIDITY changed during the search");
+          const r = await client.search({ ...query, uid: range }, { uid: true });
+          return Array.isArray(r) ? (r as number[]) : [];
+        }),
+      ),
+    );
+  } catch (e) {
+    // No bulk connection to be had (or the folder changed under us): the
+    // caller searches the folder in one go instead.
+    log.warn({ mailbox: path, err: (e as Error).message }, "sliced search failed; searching in one go");
+    return null;
+  }
+  const all = new Set<number>();
+  for (const p of parts) for (const uid of p) all.add(uid);
+  return [...all].sort((a, b) => a - b);
+}
+
+/** `n` UID ranges that together cover 1:* (the last one is open-ended). */
+export function uidRanges(uidNext: number, n: number): string[] {
+  const top = Math.max(1, uidNext - 1);
+  const step = Math.ceil(top / n);
+  const out: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const lo = i * step + 1;
+    if (lo > top) break;
+    out.push(i === n - 1 || lo + step > top ? `${lo}:*` : `${lo}:${lo + step - 1}`);
+    if (lo + step > top) break;
+  }
+  return out;
+}
+
 // What a window's SEARCH result is cached under. Without a window it is the
 // filter itself, as before, so existing cache entries stay valid.
 function windowedCacheKey(filter: Filter, window: DateWindow | undefined): unknown {
@@ -734,8 +793,16 @@ async function emailQuerySingleMailboxFull(
       uids = cached.uids;
     }
     if (!uids) {
-      const searchResult = await ctx.client.search(windowedSearch(imapFilter, window), { uid: true });
-      uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
+      const query = windowedSearch(imapFilter, window);
+      const sliced = hasFullTextTerm(filter)
+        ? await searchUidsInSlices(ctx, mboxRow.name, uidvalidity, query, status)
+        : null;
+      if (sliced) {
+        uids = sliced;
+      } else {
+        const searchResult = await ctx.client.search(query, { uid: true });
+        uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
+      }
       searchCache.set(cacheKey, {
         uids,
         modseq,
@@ -796,7 +863,7 @@ async function emailQuerySingleMailboxFull(
 // How many folders an account-wide query scans at once. The bulk pool is the
 // real ceiling; going one above it keeps a worker queued so a freed
 // connection is picked up immediately rather than sitting idle.
-const ACCOUNT_SCAN_CONCURRENCY = 3;
+const ACCOUNT_SCAN_CONCURRENCY = BULK_CONNECTIONS + 1;
 
 // Account-wide queries (tag counts, "all folders" searches) used to SELECT and
 // SEARCH every folder whenever the account's email state had moved, and any
@@ -1097,6 +1164,52 @@ async function emailQueryAccountWideFull(
     return found;
   };
 
+  // A full-text SEARCH of a large folder is split into UID ranges, each on a
+  // connection of its own (see searchUidsInSlices). That task holds no
+  // connection while its slices wait for theirs.
+  const fullText = hasFullTextTerm(filter);
+  const scanFolderInSlices = async (idx: number, row: MboxRow, pool: ImapPool): Promise<SortableHit[] | null> => {
+    const live = snapshot?.byPath.get(row.name);
+    if (!live || live.messages < SLICE_MIN_MESSAGES) return null;
+    const uidvalidity = live.uidValidity;
+    let uids: number[] | null = null;
+    const prev = getFolderSearch(ctx.store, ctx.account.id, idx, uidvalidity, filterHash);
+    if (prev && sameFolderStatus(prev, live)) uids = prev.uids;
+    if (!uids) {
+      uids = await searchUidsInSlices(ctx, row.name, uidvalidity, windowedSearch(imapFilter, window), {
+        exists: live.messages,
+        uidNext: live.uidNext,
+      });
+      if (!uids) return null;
+      putFolderSearch(ctx.store, ctx.account.id, idx, filterHash, { ...live, uids });
+    }
+    if (uids.length === 0) return [];
+    const dates = new Map<number, number>();
+    const cachedRows = ctx.store.getEmailCacheRows(ctx.account.id, idx, uidvalidity, uids);
+    const toFetch: number[] = [];
+    for (const uid of uids) {
+      const r = cachedRows.get(uid);
+      if (r && r.internaldate > 0) dates.set(uid, r.internaldate);
+      else toFetch.push(uid);
+    }
+    if (toFetch.length > 0) {
+      await pool.withConnection(ctx.account, "bulk", (client) =>
+        withMailbox(client, row.name, async () => {
+          if (!isCurrentEpoch(client, uidvalidity)) throw new Error("UIDVALIDITY changed during the search");
+          const fetched = await fetchSortMetadata(client, toFetch, false);
+          const upserts: EmailCacheUpsert[] = [];
+          for (const [uid, m2] of fetched) {
+            if (!m2.receivedAt) continue;
+            dates.set(uid, m2.receivedAt);
+            upserts.push({ accountId: ctx.account.id, mailboxId: idx, uidvalidity, uid, internaldate: m2.receivedAt });
+          }
+          ctx.store.upsertEmailCacheRows(upserts);
+        }),
+      );
+    }
+    return uids.map((uid) => ({ mailboxIdx: idx, uidvalidity, uid, receivedAt: dates.get(uid) }));
+  };
+
   const perFolder = await mapWithConcurrency(targets, ACCOUNT_SCAN_CONCURRENCY, async (t) => {
     const cachedHits = cachedFolderHits(t.idx, t.row);
     if (cachedHits) return cachedHits;
@@ -1104,6 +1217,10 @@ async function emailQueryAccountWideFull(
       // Unit-test contexts are built without a pool; fall back to the
       // request's own connection, which reproduces the old serial walk.
       if (!ctx.pool) return await scanFolder(t.idx, t.row, ctx.client);
+      if (fullText && !needsFetch) {
+        const sliced = await scanFolderInSlices(t.idx, t.row, ctx.pool);
+        if (sliced) return sliced;
+      }
       return await ctx.pool.withConnection(ctx.account, "bulk", (client) =>
         scanFolder(t.idx, t.row, client),
       );

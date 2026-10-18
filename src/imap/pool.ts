@@ -69,10 +69,21 @@ export type PoolRole = "interactive" | "bulk";
 // imapflow. Kept small so one user cannot exhaust a server's per-account
 // connection limit — IMAP servers commonly cap that in the 4-10 range, and
 // the push IDLE worker holds one more outside this pool.
+//
+// Full-text searches split a large folder over the bulk connections (the
+// server reads messages per connection, in parallel), so bulk has four: with
+// interactive and the IDLE worker that is eight, under Dovecot's default of
+// ten per user and IP. A server that refuses one sooner caps the role at what
+// it accepted (see takeFree).
+export const BULK_CONNECTIONS = 4;
 const MAX_PER_ROLE: Record<PoolRole, number> = {
   interactive: 3,
-  bulk: 2,
+  bulk: BULK_CONNECTIONS,
 };
+
+// After the server refused a new connection while the role already had some,
+// the role stays at the count that worked for this long.
+const REFUSED_CAP_MS = 10 * 60_000;
 
 // Callers that may wait for a connection per pool key. JMAP requests are also
 // limited per account (maxConcurrentRequests) before they get here; this bounds
@@ -186,7 +197,7 @@ export class ImapPool {
     }
 
     // Check and reserve in the same synchronous step, before any await.
-    if (this.slotsInUse(key) >= MAX_PER_ROLE[role]) {
+    if (this.slotsInUse(key) >= this.capFor(key, role)) {
       // A connection released while we awaited a NOOP above woke nobody (we
       // weren't queued yet): take another pass instead of parking.
       const freed = (this.entries.get(key) ?? []).some((e) => !e.busy && e.client.usable);
@@ -203,6 +214,18 @@ export class ImapPool {
       this.markSynced(entry, synced);
     } catch (e) {
       this.unreserve(key);
+      // Connections that work, or may: established ones and others still opening.
+      const established = this.slotsInUse(key);
+      if (established > 0 && isConnectionLimit(e)) {
+        // The server refused one more (a per-user connection limit): keep to
+        // the connections that work and wait for one of them, rather than fail
+        // a caller that only wanted capacity. Other failures (a bad login)
+        // still reach the caller.
+        this.refusedCap.set(key, { cap: established, until: Date.now() + REFUSED_CAP_MS });
+        log.warn({ key, cap: established, err: (e as Error).message }, "imap connection refused; capping the role");
+        const freed = (this.entries.get(key) ?? []).some((x) => !x.busy && x.client.usable);
+        return { wait: freed ? Promise.resolve() : this.waitForRelease(key) };
+      }
       // The slot is free again: let a parked caller try to open it.
       this.wake(key);
       throw e;
@@ -211,6 +234,16 @@ export class ImapPool {
     this.unreserve(key);
     this.attach(account, key, entry);
     return { entry };
+  }
+
+  private refusedCap = new Map<string, { cap: number; until: number }>();
+
+  /** The role's cap, lowered for a while after the server refused a connection. */
+  private capFor(key: string, role: PoolRole): number {
+    const r = this.refusedCap.get(key);
+    if (r && r.until > Date.now()) return Math.min(MAX_PER_ROLE[role], Math.max(1, r.cap));
+    if (r) this.refusedCap.delete(key);
+    return MAX_PER_ROLE[role];
   }
 
   /** Established plus still-opening connections for a pool key. */
@@ -324,4 +357,17 @@ export class ImapPool {
     for (const queue of this.waiters.values()) for (const resolve of queue) resolve();
     this.waiters.clear();
   }
+}
+
+/**
+ * A refusal because of the server's connection limit, as Dovecot words it
+ * ("NO [LIMIT] Maximum number of connections from user+IP exceeded") and
+ * others do ("too many connections").
+ */
+export function isConnectionLimit(e: unknown): boolean {
+  const x = (e ?? {}) as { message?: unknown; responseText?: unknown; serverResponseCode?: unknown; response?: unknown };
+  const text = [x.message, x.responseText, x.serverResponseCode, typeof x.response === "string" ? x.response : ""]
+    .filter((v) => typeof v === "string")
+    .join(" ");
+  return /\[?LIMIT\]?|maximum number of connections|too many (simultaneous |concurrent )?connections/i.test(text);
 }
