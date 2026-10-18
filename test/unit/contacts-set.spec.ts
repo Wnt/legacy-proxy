@@ -227,6 +227,43 @@ describe("CardDAV request caching", () => {
   });
 });
 
+describe("a write through the proxy is listed at once", () => {
+  // Within the listing cache's lifetime (15 s), right after a listing.
+  const fullNames = async () =>
+    (await contactCardGet({ accountId: "7", ids: null }, ctx)).list.map((c) => (c as { name?: { full?: string } }).name?.full).sort();
+
+  it("a card created, renamed and destroyed (Bulwark's trusted-sender add is a create)", async () => {
+    dav.addBook("personal", "Personal", [["alice.vcf", ALICE]]);
+    const { bookId } = await ids();
+    expect(await fullNames()).toEqual(["Alice Example"]);
+
+    const res = await contactCardSet({ accountId: "7", create: { b: {
+      addressBookIds: { [bookId]: true }, name: { full: "Bob Builder" }, emails: { e: { address: "bob@example.test" } },
+    } } }, ctx);
+    const bob = res.created!["b"]!.id;
+    expect((await contactCardQuery({ accountId: "7" }, ctx)).ids).toContain(bob);
+    expect(await fullNames()).toEqual(["Alice Example", "Bob Builder"]);
+
+    await contactCardSet({ accountId: "7", update: { [bob]: { name: { full: "Bob Renamed" } } } }, ctx);
+    expect(await fullNames()).toEqual(["Alice Example", "Bob Renamed"]);
+
+    await contactCardSet({ accountId: "7", destroy: [bob] }, ctx);
+    expect((await contactCardQuery({ accountId: "7" }, ctx)).ids).not.toContain(bob);
+    expect(await fullNames()).toEqual(["Alice Example"]);
+  });
+
+  it("a book destroyed and created again under the same name starts empty", async () => {
+    const href = dav.addBook("trusted", "Trusted", [["alice.vcf", ALICE]]);
+    expect(await fullNames()).toEqual(["Alice Example"]);
+    const id = Buffer.from(href).toString("base64url");
+    expect((await addressBookSet({ accountId: "7", destroy: [id], onDestroyRemoveContents: true }, ctx)).destroyed).toEqual([id]);
+    expect(await fullNames()).toEqual([]);
+    const made = await addressBookSet({ accountId: "7", create: { t: { name: "trusted" } } }, ctx);
+    expect(Buffer.from(made.created!["t"]!.id, "base64url").toString()).toBe(href);
+    expect(await fullNames()).toEqual([]);
+  });
+});
+
 async function ids(): Promise<{ bookId: string; cardIds: string[] }> {
   const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
   const q = await contactCardQuery({ accountId: "7" }, ctx);

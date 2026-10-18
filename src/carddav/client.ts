@@ -75,9 +75,11 @@ const bookListCache = new Map<string, BookListEntry>();
 const BOOK_LIST_TTL_MS = 15_000;
 
 // Per-collection resource listing (href + etag), same lifetime rules as the
-// book list above. Two callers want it: ContactCard/query, which turns it
-// straight into ids, and multiGet, which uses the etags to decide which cards
-// it already holds.
+// book list above: a write to a card of the book (create, update, destroy),
+// or to the book itself (create, destroy, rename), drops it. Two callers want
+// it: ContactCard/query, which turns it straight into ids, and multiGet, which
+// uses the etags to decide which cards it already holds; a stale listing hid a
+// card written a moment ago, or served its old body.
 interface ResourceListEntry {
   resources: Array<{ href: string; etag: string | null }>;
   at: number;
@@ -110,8 +112,13 @@ function rememberVCard(key: string, data: string): void {
   }
 }
 
-// HTTP methods that only read. Anything else invalidates the cached book list.
+// HTTP methods that only read. Anything else invalidates the cached book list
+// and the listing of the book written to.
 const READ_METHODS = new Set(["PROPFIND", "REPORT", "GET", "HEAD", "OPTIONS"]);
+
+// Writes started per identity. A listing read that overlaps a write may hold
+// the state from before it, so it is returned but not cached.
+const writesStarted = new Map<string, number>();
 
 /**
  * Drop every memoised discovery result and book list. Production code never
@@ -124,6 +131,7 @@ export function resetCardDavCaches(): void {
   bookListCache.clear();
   resourceListCache.clear();
   vcardCache.clear();
+  writesStarted.clear();
 }
 
 function freshEntry<T extends { at: number }>(entry: T | undefined, ttl: number): T | null {
@@ -202,6 +210,7 @@ export class CardDavClient {
   async listAddressBooks(): Promise<AddressBookInfo[]> {
     const cached = freshEntry(bookListCache.get(this.cacheKey), BOOK_LIST_TTL_MS);
     if (cached) return cached.books;
+    const writes = writesStarted.get(this.cacheKey) ?? 0;
 
     const home = await this.addressBookHome();
 
@@ -232,7 +241,7 @@ export class CardDavClient {
         ctag: textOf(r, "getctag") ?? textOf(r, "sync-token"),
       });
     }
-    bookListCache.set(this.cacheKey, { books, at: Date.now() });
+    if ((writesStarted.get(this.cacheKey) ?? 0) === writes) bookListCache.set(this.cacheKey, { books, at: Date.now() });
     return books;
   }
 
@@ -241,6 +250,7 @@ export class CardDavClient {
     const listKey = `${this.cacheKey}|${bookHref}`;
     const cached = freshEntry(resourceListCache.get(listKey), RESOURCE_LIST_TTL_MS);
     if (cached) return cached.resources;
+    const writes = writesStarted.get(this.cacheKey) ?? 0;
 
     const xml = await this.propfind(bookHref, 1, ["DAV:getetag", "DAV:resourcetype"]);
     const responses = splitResponses(xml);
@@ -251,7 +261,7 @@ export class CardDavClient {
       if (!href || !this.isMember(bookHref, href)) continue;
       out.push({ href, etag: textOf(r, "getetag") });
     }
-    resourceListCache.set(listKey, { resources: out, at: Date.now() });
+    if ((writesStarted.get(this.cacheKey) ?? 0) === writes) resourceListCache.set(listKey, { resources: out, at: Date.now() });
     return out;
   }
 
@@ -490,12 +500,40 @@ export class CardDavClient {
     body: string | null,
     headers: Record<string, string> = {},
   ): Promise<Response> {
-    let url = this.resolve(path);
-    // Any write invalidates the cached book list before it is issued: a PUT or
-    // DELETE moves the collection's ctag (and so its JMAP state), and MKCOL /
-    // PROPPATCH change the set itself. Dropping it up front rather than after
-    // means a write that fails midway can't leave a stale list behind.
-    if (!READ_METHODS.has(method.toUpperCase())) bookListCache.delete(this.cacheKey);
+    const url = this.resolve(path);
+    // Any write invalidates the cached book list, and the listing of the book
+    // it writes to, before it is issued and again once it has answered: a PUT
+    // or DELETE moves the collection's ctag (and so its JMAP state) and its
+    // members, and MKCOL / PROPPATCH change the set itself. Up front, so a
+    // write that fails midway can't leave a stale list behind; afterwards, so
+    // a listing read while it ran isn't kept either (see writesStarted).
+    const write = !READ_METHODS.has(method.toUpperCase());
+    if (write) this.forgetListings(url.pathname);
+    try {
+      return await this.send(method, url, body, headers);
+    } finally {
+      if (write) this.forgetListings(url.pathname);
+    }
+  }
+
+  /** The cached book list, and the listing of every cached book `path` is in or is. */
+  private forgetListings(path: string): void {
+    writesStarted.set(this.cacheKey, (writesStarted.get(this.cacheKey) ?? 0) + 1);
+    bookListCache.delete(this.cacheKey);
+    const prefix = `${this.cacheKey}|`;
+    for (const key of [...resourceListCache.keys()]) {
+      if (key.startsWith(prefix) && this.isWithin(key.slice(prefix.length), path, "descendant-or-self")) {
+        resourceListCache.delete(key);
+      }
+    }
+  }
+
+  private async send(
+    method: string,
+    url: URL,
+    body: string | null,
+    headers: Record<string, string>,
+  ): Promise<Response> {
     // Redirects are followed by hand, and only on the configured server, so the
     // Authorization header is never sent to wherever a Location points.
     for (let hop = 0; ; hop++) {
