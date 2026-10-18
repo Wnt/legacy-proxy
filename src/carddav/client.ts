@@ -21,6 +21,11 @@ export interface CardDavOpts {
   basePath?: string;        // e.g. "/dav" - root of the DAV namespace
   principalPath?: string;   // override discovery, e.g. "/dav/addressbook/user@x.io/"
   creds: Credentials;
+  /**
+   * Aborts this client's reads when the JMAP request that made it is gone (the
+   * HTTP client disconnected). Writes are not cut off midway.
+   */
+  signal?: AbortSignal;
 }
 
 export interface AddressBookInfo {
@@ -363,6 +368,36 @@ export class CardDavClient {
         throw new Error(`CardDAV MKCOL ${href} → property failure: ${text.slice(0, 200)}`);
       }
     }
+    // Some servers answer 201 but drop the properties in the MKCOL body: SOGo
+    // (Gandi) names the collection after its URL leaf. A client that finds its
+    // book by name then never finds it and creates another on every load, so
+    // read the properties back and PROPPATCH what did not stick. If even that
+    // fails, the collection would be a nameless orphan: remove it again.
+    try {
+      const got = await this.collectionProps(href);
+      const fix: { displayName?: string; description?: string | null } = {};
+      if (got.displayName !== props.displayName) fix.displayName = props.displayName;
+      if (props.description && got.description !== props.description) fix.description = props.description;
+      if (fix.displayName === undefined && fix.description === undefined) return;
+      await this.updateAddressBookProps(href, fix);
+      const again = await this.collectionProps(href);
+      if (again.displayName !== props.displayName) {
+        throw new Error(`CardDAV MKCOL ${href}: the server did not keep the display name`);
+      }
+    } catch (e) {
+      await this.raw("DELETE", href, null).catch(() => undefined);
+      throw e;
+    }
+  }
+
+  /** displayname and addressbook-description of one collection (Depth 0). */
+  private async collectionProps(href: string): Promise<{ displayName: string | null; description: string | null }> {
+    const xml = await this.propfind(href, 0, [
+      "DAV:displayname",
+      "urn:ietf:params:xml:ns:carddav addressbook-description",
+    ]);
+    const self = splitResponses(xml)[0] ?? xml;
+    return { displayName: textOf(self, "displayname"), description: textOf(self, "addressbook-description") };
   }
 
   /** PROPPATCH displayname / addressbook-description on a collection. */
@@ -469,6 +504,7 @@ export class CardDavClient {
         headers: { Authorization: this.authHeader, ...headers },
         ...(body === null ? {} : { body }),
         redirect: "manual",
+        ...(this.opts.signal && READ_METHODS.has(method.toUpperCase()) ? { signal: this.opts.signal } : {}),
       });
       log.debug({ method, url: url.href, status: res.status }, "carddav request");
       const loc = isRedirect(res.status) ? res.headers.get("location") : null;
@@ -490,6 +526,7 @@ export class CardDavClient {
         headers: { Authorization: this.authHeader, Depth: "0", "Content-Type": "application/xml" },
         body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>',
         redirect: "manual",
+        ...(this.opts.signal ? { signal: this.opts.signal } : {}),
       });
       log.debug({ url: url.href, status: res.status }, "carddav discovery probe");
       if (res.status >= 300 && res.status < 400) {

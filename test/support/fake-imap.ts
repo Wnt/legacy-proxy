@@ -134,6 +134,8 @@ export class FakeImapServer {
   connections = 0;
   /** Like Dovecot's mail_max_userip_connections: LOGIN beyond this many open sessions is refused. */
   maxConnections = Infinity;
+  /** Holds a command this long before answering it (e.g. a slow full-text SEARCH). Commands on one connection stay in order. */
+  commandDelayMs: ((line: string) => number) | null = null;
   private server: net.Server | null = null;
   private sockets = new Set<net.Socket>();
   port = 0;
@@ -214,6 +216,8 @@ export class FakeImapServer {
     let buf = Buffer.alloc(0);
     let pending = "";
     let literal = 0;
+    // Commands waiting behind a delayed one (see commandDelayMs).
+    let queued: Promise<unknown> | null = null;
     const w = (s: string) => {
       if (!sock.destroyed) sock.write(s, "latin1");
     };
@@ -244,11 +248,25 @@ export class FakeImapServer {
         }
         const full = (pending + line).replace(/\u0000([^]*?)(?=\s|\)|$)/g, (_m, v: string) => q(v));
         pending = "";
-        try {
-          this.command(full, conn, w, () => selected, (f) => (selected = f), () => sock.end());
-        } catch (e) {
-          const tag = full.split(" ")[0];
-          w(`${tag} BAD ${(e as Error).message}\r\n`);
+        const run = () => {
+          try {
+            this.command(full, conn, w, () => selected, (f) => (selected = f), () => sock.end());
+          } catch (e) {
+            const tag = full.split(" ")[0];
+            w(`${tag} BAD ${(e as Error).message}\r\n`);
+          }
+        };
+        const delay = this.commandDelayMs?.(full) ?? 0;
+        if (delay > 0 || queued) {
+          const next: Promise<unknown> = (queued ?? Promise.resolve())
+            .then(() => (delay > 0 ? new Promise((r) => setTimeout(r, delay)) : undefined))
+            .then(run);
+          queued = next;
+          void next.then(() => {
+            if (queued === next) queued = null;
+          });
+        } else {
+          run();
         }
       }
     });

@@ -10,7 +10,8 @@ import { ImapPool } from "./imap/pool.js";
 import { resolveProvider, resolveProviderName } from "./auth/providers.js";
 import { sealCredentials, openCredentials, type Credentials } from "./auth/credentials.js";
 import { makeSession, signSession, verifySession } from "./auth/session.js";
-import { KeyedLimiter, LimitError } from "./util/limiter.js";
+import { LimitError } from "./util/limiter.js";
+import { RequestAdmission } from "./jmap/admission.js";
 import { buildSession } from "./jmap/session.js";
 import { KNOWN_CAPABILITIES } from "./jmap/capabilities.js";
 import { dispatch, type RequestEnvelope } from "./jmap/router.js";
@@ -146,10 +147,11 @@ app.get("/jmap/session", async (req, reply) => {
   return buildSession(cfg, account, provider);
 });
 
-// The advertised maxConcurrentRequests, enforced per account. Requests over it
-// wait (a browser fans out a few at once on a push); only a backlog beyond
-// that is refused.
-const requestLimiter = new KeyedLimiter(
+// The advertised maxConcurrentRequests, enforced per account and lane (see
+// jmap/admission.ts: a long search must not hold up contacts or mail).
+// Requests over it wait (a browser fans out a few at once on a push); only a
+// backlog beyond that is refused.
+const requestAdmission = new RequestAdmission(
   cfg.limits.maxConcurrentRequests,
   cfg.limits.maxConcurrentRequests * 4,
 );
@@ -177,8 +179,9 @@ app.post("/jmap", async (req, reply) => {
     if (!reply.raw.writableFinished) abort.abort();
   });
   try {
-    const out = await requestLimiter.run(
+    const out = await requestAdmission.run(
       String(account.id),
+      env,
       () =>
         dispatch(env, {
           methods: makeLegacyMethods({ cfg, pool, store, account, dispatcher, signal: abort.signal }),

@@ -16,191 +16,7 @@ import {
 import type { AccountRow } from "../../src/state/store.js";
 import type { ProviderConfig } from "../../src/util/config.js";
 import { resetCardDavCaches } from "../../src/carddav/client.js";
-
-// -- fake CardDAV server ------------------------------------------------------
-
-interface Resource {
-  data: string;
-  etag: string;
-}
-interface Book {
-  displayName: string;
-  description: string | null;
-  resources: Map<string, Resource>;
-}
-
-const HOME = "/books/u/";
-const PRINCIPAL = "/principals/u/";
-
-class FakeDav {
-  books = new Map<string, Book>();
-  calls: Array<{ method: string; path: string; headers: Record<string, string>; body: string }> = [];
-  private etagSeq = 0;
-
-  addBook(slug: string, displayName: string, cards: Array<[string, string]> = []): string {
-    const href = `${HOME}${slug}/`;
-    const book: Book = { displayName, description: null, resources: new Map() };
-    for (const [file, data] of cards) book.resources.set(href + file, { data, etag: this.nextEtag() });
-    this.books.set(href, book);
-    return href;
-  }
-
-  nextEtag(): string {
-    return `"e${++this.etagSeq}"`;
-  }
-
-  handle(method: string, url: string, headers: Record<string, string>, body: string): Response {
-    const path = decodeURIComponent(new URL(url).pathname);
-    this.calls.push({ method, path, headers, body });
-    if (headers["authorization"] !== "Basic " + Buffer.from("u:p").toString("base64")) {
-      return new Response("nope", { status: 401 });
-    }
-    // Strict servers (Radicale) reject XML with a namespace-prefixed name
-    // inside the local name — the client once emitted `<D:DAV:resourcetype/>`.
-    if (/<[A-Za-z]+:[A-Za-z]+:/.test(body)) return new Response("malformed XML", { status: 400 });
-    switch (method) {
-      case "PROPFIND":
-        return this.propfind(path, headers["depth"] ?? "0", body);
-      case "REPORT":
-        return this.report(path, body);
-      case "PUT":
-        return this.put(path, headers, body);
-      case "DELETE":
-        return this.delete(path, headers);
-      case "MKCOL":
-        return this.mkcol(path, body);
-      case "PROPPATCH":
-        return this.proppatch(path, body);
-    }
-    return new Response("method", { status: 405 });
-  }
-
-  private ms(responses: string): Response {
-    const xml = `<?xml version="1.0"?><D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav" xmlns:CS="http://calendarserver.org/ns/">${responses}</D:multistatus>`;
-    return new Response(xml, { status: 207, headers: { "content-type": "application/xml" } });
-  }
-
-  private bookResponse(href: string, b: Book): string {
-    const ctag = Array.from(b.resources.values()).map((r) => r.etag).join("");
-    return `<D:response><D:href>${href}</D:href><D:propstat><D:prop>
-      <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>
-      <D:displayname>${esc(b.displayName)}</D:displayname>
-      ${b.description ? `<C:addressbook-description>${esc(b.description)}</C:addressbook-description>` : ""}
-      <CS:getctag>"${esc(ctag)}"</CS:getctag>
-    </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
-  }
-
-  private propfind(path: string, depth: string, body: string): Response {
-    if (path === "/") {
-      return this.ms(`<D:response><D:href>/</D:href><D:propstat><D:prop>
-        <D:resourcetype><D:collection/></D:resourcetype>
-        <D:current-user-principal><D:href>${PRINCIPAL}</D:href></D:current-user-principal>
-      </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`);
-    }
-    if (path === PRINCIPAL) {
-      return this.ms(`<D:response><D:href>${PRINCIPAL}</D:href><D:propstat><D:prop>
-        <C:addressbook-home-set><D:href>${HOME}</D:href></C:addressbook-home-set>
-      </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`);
-    }
-    if (path === HOME) {
-      const self = `<D:response><D:href>${HOME}</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
-      if (depth === "0") return this.ms(self);
-      return this.ms(self + Array.from(this.books.entries()).map(([h, b]) => this.bookResponse(h, b)).join(""));
-    }
-    const book = this.books.get(path);
-    if (book) {
-      let out = this.bookResponse(path, book);
-      if (depth === "1") {
-        for (const [h, r] of book.resources) {
-          out += `<D:response><D:href>${h}</D:href><D:propstat><D:prop><D:resourcetype/><D:getetag>${esc(r.etag)}</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
-        }
-      }
-      return this.ms(out);
-    }
-    void body;
-    return new Response("not found", { status: 404 });
-  }
-
-  private report(path: string, body: string): Response {
-    const book = this.books.get(path);
-    if (!book) return new Response("not found", { status: 404 });
-    const hrefs = Array.from(body.matchAll(/<D:href>([^<]+)<\/D:href>/g)).map((m) => m[1]!);
-    let out = "";
-    for (const h of hrefs) {
-      const r = book.resources.get(h);
-      if (!r) {
-        out += `<D:response><D:href>${h}</D:href><D:status>HTTP/1.1 404 Not Found</D:status></D:response>`;
-        continue;
-      }
-      out += `<D:response><D:href>${h}</D:href><D:propstat><D:prop><D:getetag>${esc(r.etag)}</D:getetag><C:address-data>${esc(r.data)}</C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
-    }
-    return this.ms(out);
-  }
-
-  private bookFor(resourcePath: string): [string, Book] | null {
-    for (const [h, b] of this.books) if (resourcePath.startsWith(h)) return [h, b];
-    return null;
-  }
-
-  private put(path: string, headers: Record<string, string>, body: string): Response {
-    const hit = this.bookFor(path);
-    if (!hit) return new Response("no such collection", { status: 409 });
-    const [, book] = hit;
-    const existing = book.resources.get(path);
-    if (headers["if-none-match"] === "*" && existing) return new Response("exists", { status: 412 });
-    if (headers["if-match"] && (!existing || existing.etag !== headers["if-match"])) {
-      return new Response("etag mismatch", { status: 412 });
-    }
-    if (!/^text\/vcard/.test(headers["content-type"] ?? "")) return new Response("type", { status: 415 });
-    if (!/BEGIN:VCARD/.test(body) || !/\r\nUID:/.test(body)) return new Response("bad vcard", { status: 400 });
-    const etag = this.nextEtag();
-    book.resources.set(path, { data: body, etag });
-    return new Response(null, { status: existing ? 204 : 201, headers: { etag } });
-  }
-
-  private delete(path: string, headers: Record<string, string>): Response {
-    if (this.books.has(path)) {
-      this.books.delete(path);
-      return new Response(null, { status: 204 });
-    }
-    const hit = this.bookFor(path);
-    if (!hit) return new Response("not found", { status: 404 });
-    const [, book] = hit;
-    const existing = book.resources.get(path);
-    if (!existing) return new Response("not found", { status: 404 });
-    if (headers["if-match"] && existing.etag !== headers["if-match"]) return new Response("etag", { status: 412 });
-    book.resources.delete(path);
-    return new Response(null, { status: 204 });
-  }
-
-  private mkcol(path: string, body: string): Response {
-    if (this.books.has(path)) return new Response("exists", { status: 405 });
-    if (!path.startsWith(HOME)) return new Response("conflict", { status: 409 });
-    if (!/<C:addressbook\/>/.test(body)) return new Response("not an addressbook", { status: 403 });
-    const name = /<D:displayname>([^<]*)<\/D:displayname>/.exec(body)?.[1] ?? "";
-    const desc = /<C:addressbook-description>([^<]*)<\/C:addressbook-description>/.exec(body)?.[1] ?? null;
-    this.books.set(path, { displayName: unesc(name), description: desc ? unesc(desc) : null, resources: new Map() });
-    return new Response(null, { status: 201 });
-  }
-
-  private proppatch(path: string, body: string): Response {
-    const book = this.books.get(path);
-    if (!book) return new Response("not found", { status: 404 });
-    const name = /<D:displayname>([^<]*)<\/D:displayname>/.exec(body)?.[1];
-    if (name !== undefined) book.displayName = unesc(name);
-    const desc = /<C:addressbook-description>([^<]*)<\/C:addressbook-description>/.exec(body)?.[1];
-    if (desc !== undefined) book.description = unesc(desc);
-    if (/<D:remove>[\s\S]*addressbook-description/.test(body)) book.description = null;
-    return this.ms(`<D:response><D:href>${path}</D:href><D:propstat><D:prop><D:displayname/></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`);
-  }
-}
-
-function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-function unesc(s: string): string {
-  return s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&amp;/g, "&");
-}
+import { FakeDav, HOME, PRINCIPAL, installFakeDav } from "../support/fake-dav.js";
 
 // -- fixtures -----------------------------------------------------------------
 
@@ -341,15 +157,7 @@ beforeEach(() => {
   // cross-instance discovery/book caches must be cleared with it.
   resetCardDavCaches();
   dav = new FakeDav();
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      const headers: Record<string, string> = {};
-      for (const [k, v] of Object.entries((init?.headers ?? {}) as Record<string, string>)) headers[k.toLowerCase()] = v;
-      return dav.handle(init?.method ?? "GET", url, headers, typeof init?.body === "string" ? init.body : "");
-    }),
-  );
+  installFakeDav(dav);
 });
 
 afterEach(() => {
@@ -688,6 +496,121 @@ describe("AddressBook/set", () => {
     const ok = await addressBookSet({ accountId: "7", destroy: [id], onDestroyRemoveContents: true }, ctx);
     expect(ok.destroyed).toEqual([id]);
     expect(dav.books.has(href)).toBe(false);
+  });
+});
+
+// -- servers that drop MKCOL properties (SOGo, Gandi) -------------------------
+
+describe("AddressBook/set on a server that ignores the MKCOL body", () => {
+  // SOGo answers 201 to an extended MKCOL but names the collection after its
+  // URL leaf. A client that looks its book up by name (Bulwark's "Trusted
+  // Senders") then never found it and created another one on every load.
+  const findOrCreate = async (name: string): Promise<string> => {
+    const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
+    const hit = books.list.find((b) => b.name === name);
+    if (hit) return hit.id;
+    const res = await addressBookSet({ accountId: "7", create: { b: { name } } }, ctx);
+    expect(res.notCreated).toBeNull();
+    return res.created!["b"]!.id;
+  };
+
+  it("sets the name with PROPPATCH, so a find-or-create client creates the book once", async () => {
+    dav.sogoMkcol = true;
+    dav.addBook("personal", "Personal Address Book");
+    const first = await findOrCreate("Trusted Senders");
+    for (let load = 0; load < 3; load++) expect(await findOrCreate("Trusted Senders")).toBe(first);
+
+    expect(dav.calls.filter((c) => c.method === "MKCOL")).toHaveLength(1);
+    expect(dav.books.get(Buffer.from(first, "base64url").toString())!.displayName).toBe("Trusted Senders");
+    const books = await addressBookGet({ accountId: "7", ids: null }, ctx);
+    expect(books.list.map((b) => b.name)).toEqual(["Personal Address Book", "Trusted Senders"]);
+  });
+
+  it("also names a colliding (UUID-slug) book and the description", async () => {
+    dav.sogoMkcol = true;
+    dav.addBook("trusted-senders", "trusted-senders");
+    const res = await addressBookSet({ accountId: "7", create: { b: { name: "Trusted Senders", description: "allow list" } } }, ctx);
+    const href = Buffer.from(res.created!["b"]!.id, "base64url").toString();
+    expect(href).toMatch(new RegExp(`^${HOME}[0-9a-f-]{36}/$`));
+    expect(dav.books.get(href)).toMatchObject({ displayName: "Trusted Senders", description: "allow list" });
+  });
+
+  it("does not PROPPATCH when the MKCOL body was honoured", async () => {
+    await addressBookSet({ accountId: "7", create: { b: { name: "Work" } } }, ctx);
+    expect(dav.calls.filter((c) => c.method === "PROPPATCH")).toHaveLength(0);
+  });
+
+  it("removes the new collection again when the name cannot be set at all", async () => {
+    dav.sogoMkcol = true;
+    const serve = dav.serve.bind(dav);
+    dav.serve = async (method, url, headers, body, signal) =>
+      method === "PROPPATCH" ? new Response("forbidden", { status: 403 }) : serve(method, url, headers, body, signal);
+    const res = await addressBookSet({ accountId: "7", create: { b: { name: "Trusted Senders" } } }, ctx);
+    expect(res.created).toBeNull();
+    expect(res.notCreated?.["b"]).toBeDefined();
+    expect([...dav.books.keys()]).toEqual([]);
+  });
+});
+
+// -- ContactCard/query over many books ----------------------------------------
+
+describe("ContactCard/query", () => {
+  const vcard = (uid: string, fn: string, email: string) =>
+    ["BEGIN:VCARD", "VERSION:4.0", `UID:${uid}`, `FN:${fn}`, `EMAIL:${email}`, "END:VCARD", ""].join("\r\n");
+
+  it("lists the books' resources concurrently, not one PROPFIND after another", async () => {
+    for (let i = 0; i < 12; i++) dav.addBook(`b${String(i).padStart(2, "0")}`, `Book ${i}`, [[`c${i}.vcf`, vcard(`u${i}`, `Name ${i}`, `n${i}@example.test`)]]);
+    await addressBookGet({ accountId: "7", ids: null }, ctx);
+    dav.delayMs = 20;
+    dav.maxInflight = 0;
+    const res = await contactCardQuery({ accountId: "7" }, ctx);
+    expect(res.total).toBe(12);
+    expect(dav.maxInflight).toBeGreaterThan(1);
+    expect(dav.maxInflight).toBeLessThanOrEqual(4);
+    // Book order is kept.
+    expect(res.ids.map((id) => Buffer.from(id, "base64url").toString().split("\n")[0])).toEqual(
+      [...dav.books.keys()],
+    );
+  });
+
+  it("applies a text filter (name, email) instead of returning every card", async () => {
+    dav.addBook("personal", "Personal", [
+      ["a.vcf", vcard("ua", "Erkki Esimerkki", "erkki@examplepaja.test")],
+      ["b.vcf", vcard("ub", "Maija Malli", "maija@sample.test")],
+      ["c.vcf", vcard("uc", "Examplepaja Oy", "info@other.test")],
+    ]);
+    const byText = async (text: string) => {
+      const q = await contactCardQuery({ accountId: "7", filter: { text } }, ctx);
+      const g = await contactCardGet({ accountId: "7", ids: q.ids }, ctx);
+      return g.list.map((c) => c.uid).sort();
+    };
+    expect(await byText("examplepaja")).toEqual(["ua", "uc"]);
+    expect(await byText("MAIJA")).toEqual(["ub"]);
+    expect(await byText("nobody")).toEqual([]);
+    const email = await contactCardQuery({ accountId: "7", filter: { email: "sample.test" } }, ctx);
+    expect(email.total).toBe(1);
+  });
+
+  it("rejects filters it cannot evaluate rather than ignoring them", async () => {
+    dav.addBook("personal", "Personal");
+    await expect(contactCardQuery({ accountId: "7", filter: { hasMember: "x" } }, ctx)).rejects.toMatchObject({ type: "unsupportedFilter" });
+    await expect(
+      contactCardQuery({ accountId: "7", filter: { operator: "OR", conditions: [] } }, ctx),
+    ).rejects.toMatchObject({ type: "unsupportedFilter" });
+  });
+
+  it("stops reading from the CardDAV server once the request is aborted", async () => {
+    for (let i = 0; i < 8; i++) dav.addBook(`b${i}`, `Book ${i}`);
+    await addressBookGet({ accountId: "7", ids: null }, ctx);
+    dav.delayMs = 50;
+    const abort = new AbortController();
+    const p = contactCardQuery({ accountId: "7" }, { ...ctx, signal: abort.signal });
+    await new Promise((r) => setTimeout(r, 10));
+    abort.abort();
+    await expect(p).rejects.toBeDefined();
+    const before = dav.calls.length;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(dav.calls.length).toBe(before);
   });
 });
 
