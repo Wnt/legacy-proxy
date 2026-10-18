@@ -68,6 +68,15 @@ function headerValue(header: string, name: string): string | undefined {
   return re.exec(header)?.[1]?.replace(/\r\n[ \t]+/g, " ");
 }
 
+const has = (hay: string, needle: Tok | undefined) => hay.toLowerCase().includes(String(needle ?? "").toLowerCase());
+const dayStart = (d: Date) => Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+function imapDay(t: Tok | undefined): number {
+  const m = /^(\d{1,2})-([a-z]{3})-(\d{4})$/i.exec(String(t ?? ""));
+  if (!m) throw new Error(`fake IMAP: bad SEARCH date ${String(t)}`);
+  return Date.UTC(Number(m[3]), MONTHS.indexOf(m[2]!.toLowerCase()), Number(m[1]));
+}
+
 /** Parse an IMAP sequence/UID set against the folder's highest UID. */
 function inSet(set: string, max: number): (n: number) => boolean {
   const ranges = set.split(",").map((r) => {
@@ -424,6 +433,14 @@ export class FakeImapServer {
         case "NOT": return !one();
         case "OR": { const a = one(); const b = one(); return a || b; }
         case "MODSEQ": return m.modseq > BigInt(String(crit[i++]));
+        // Like Dovecot without a full-text index: case-insensitive substring
+        // matches; dates by the internal date's day (UTC here).
+        case "TEXT": return has(m.header + m.body, crit[i++]);
+        case "BODY": return has(m.body, crit[i++]);
+        case "FROM": case "TO": case "CC": case "BCC": case "SUBJECT":
+          return has(headerValue(m.header, k === "SUBJECT" ? "Subject" : k[0] + k.slice(1).toLowerCase()) ?? "", crit[i++]);
+        case "SINCE": return dayStart(m.internalDate) >= imapDay(crit[i++]);
+        case "BEFORE": return dayStart(m.internalDate) < imapDay(crit[i++]);
         default:
           if (/^[\d:*,]+$/.test(k)) return inSet(k, f.msgs.length)(seq);
           throw new Error(`fake IMAP: unsupported SEARCH key ${k}`);

@@ -20,7 +20,7 @@ import {
 import { selectedUidValidity, withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
-import { compileFilter, UnsupportedFilter, type Filter } from "../../imap/search.js";
+import { compileFilter, UnsupportedFilter, type Filter, type ImapSearch } from "../../imap/search.js";
 import { listMailboxes, refreshMailboxCounts } from "./mailbox.js";
 import { log } from "../../util/log.js";
 import { mapWithConcurrency } from "../../util/concurrency.js";
@@ -144,7 +144,7 @@ function searchCacheKey(
   accountId: number,
   mailboxIdx: number,
   uidvalidity: number,
-  filter: Filter,
+  filter: unknown,
 ): string {
   return `${accountId}|${mailboxIdx}|${uidvalidity}|${stableHash(filter)}`;
 }
@@ -278,7 +278,7 @@ export async function emailQuery(
   queryState: string;
   canCalculateChanges: boolean;
   position: number;
-  total: number;
+  total?: number;
   ids: string[];
 }> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
@@ -304,9 +304,37 @@ export async function emailQuery(
   const lim = Math.min(args.limit ?? 50, 500);
 
   const inMailbox = findInMailbox(filter);
-  const full = inMailbox
-    ? await emailQuerySingleMailboxFull(ctx, filter, imapFilter, inMailbox, sort, ascending, needsFetch)
-    : await emailQueryAccountWideFull(ctx, filter, imapFilter, sort, ascending, needsFetch);
+  const run = (window?: DateWindow) =>
+    inMailbox
+      ? emailQuerySingleMailboxFull(ctx, filter, imapFilter, inMailbox, sort, ascending, needsFetch, window)
+      : emailQueryAccountWideFull(ctx, filter, imapFilter, sort, ascending, needsFetch, window);
+
+  let full: { ids: string[]; queryState: string };
+  // False only when a windowed search stopped before its oldest window: the
+  // ids are then an exact prefix of the result, and its length is unknown.
+  let complete = true;
+  if (canSearchInWindows(args, filter, imapFilter, sort, ctx)) {
+    const needed = Math.max(0, args.position ?? 0) + lim;
+    const windows = textSearchWindows(new Date());
+    const ids: string[] = [];
+    let queryState: string | null = null;
+    complete = false;
+    for (let i = 0; i < windows.length; i++) {
+      const part = await run(windows[i]);
+      // The first window's state: no later window's view is older.
+      queryState ??= part.queryState;
+      for (const id of part.ids) ids.push(id);
+      if (i === windows.length - 1) {
+        complete = true;
+        break;
+      }
+      const have = args.collapseThreads === true ? (await collapseByThread(ctx, ids)).length : ids.length;
+      if (have >= needed) break;
+    }
+    full = { ids, queryState: queryState! };
+  } else {
+    full = await run();
+  }
 
   let orderedIds = full.ids;
 
@@ -343,19 +371,7 @@ export async function emailQuery(
   }
 
   if (args.collapseThreads === true) {
-    // Only the matched ids' threads matter: look those up, rather than load
-    // the whole account's thread index (seconds on a 100k-message account).
-    await syncThreadRows(ctx);
-    const threadOf = threadIdsOf(ctx.store, ctx.account.id, orderedIds);
-    const seen = new Set<string>();
-    const dedup: string[] = [];
-    for (const id of orderedIds) {
-      const tid = threadOf.get(id) ?? id;
-      if (seen.has(tid)) continue;
-      seen.add(tid);
-      dedup.push(id);
-    }
-    orderedIds = dedup;
+    orderedIds = await collapseByThread(ctx, orderedIds);
   }
 
   const start = resolveQueryStart(orderedIds, args);
@@ -364,9 +380,110 @@ export async function emailQuery(
     queryState: full.queryState,
     canCalculateChanges: false,
     position: start,
-    total: orderedIds.length,
+    // RFC 8620 §5.5: `total` is only owed when calculateTotal was asked for;
+    // a windowed search that stopped early does not know it.
+    ...(complete ? { total: orderedIds.length } : {}),
     ids: orderedIds.slice(start, start + lim),
   };
+}
+
+// The newest id of each thread, in the given order. Only the matched ids'
+// threads matter: look those up, rather than load the whole account's thread
+// index (seconds on a 100k-message account).
+async function collapseByThread(ctx: MailCtx, ids: string[]): Promise<string[]> {
+  await syncThreadRows(ctx);
+  const threadOf = threadIdsOf(ctx.store, ctx.account.id, ids);
+  const seen = new Set<string>();
+  const dedup: string[] = [];
+  for (const id of ids) {
+    const tid = threadOf.get(id) ?? id;
+    if (seen.has(tid)) continue;
+    seen.add(tid);
+    dedup.push(id);
+  }
+  return dedup;
+}
+
+// Full-text search, newest first, in date windows.
+//
+// A `text` or `body` criterion makes the IMAP server read every message it
+// considers. A server without a full-text index (Dovecot without FTS) scans
+// on the order of a thousand messages a second per connection, so a search of
+// a mailbox with tens of thousands of messages takes tens of seconds: longer
+// than clients wait, and a client that gives up may show an empty result.
+// The server does filter on the internal date first, from its index, so a
+// search bounded with SINCE/BEFORE costs only the messages inside the bounds.
+//
+// When the client asks for no total, newest first, the page it wants is
+// decided by the newest matches only. The query then runs over consecutive
+// date windows, newest window first, and stops as soon as the windows read so
+// far hold `position + limit` matches. The windows partition time (SINCE d
+// and BEFORE d split at the same day boundary on the server), so every match
+// in a window is newer than every match in the windows after it: the windows
+// read hold exactly the newest matches. (Within one folder the unwindowed
+// search orders by UID; a message filed late with an old date is placed by
+// its date here, which is what receivedAt order asks for.) A search that
+// reaches the oldest window has read everything and also reports its total.
+export interface DateWindow {
+  since?: Date;
+  before?: Date;
+}
+
+// Window bounds, in months before the start of the current month (UTC).
+// Fixed calendar bounds keep each window's per-folder SEARCH results reusable
+// all month; widening steps keep a rare term to a handful of extra round trips.
+const TEXT_SEARCH_WINDOW_MONTHS = [1, 4, 13, 37];
+
+export function textSearchWindows(now: Date): DateWindow[] {
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const bounds = TEXT_SEARCH_WINDOW_MONTHS.map((k) => new Date(Date.UTC(y, m - k, 1)));
+  const out: DateWindow[] = [{ since: bounds[0] }];
+  for (let i = 1; i < bounds.length; i++) out.push({ since: bounds[i], before: bounds[i - 1] });
+  out.push({ before: bounds[bounds.length - 1] });
+  return out;
+}
+
+function hasFullTextTerm(f: Filter): boolean {
+  if ("operator" in f) return f.conditions.some(hasFullTextTerm);
+  return !!(f.text?.trim() || f.body?.trim());
+}
+
+function canSearchInWindows(
+  args: EmailQueryArgs,
+  filter: Filter,
+  imapFilter: ImapSearch,
+  sort: SortSpec[],
+  ctx: MailCtx,
+): boolean {
+  if (args.calculateTotal === true || args.anchor !== undefined) return false;
+  if ((args.position ?? 0) < 0) return false;
+  // Gmail answers X-GM-RAW from its own index.
+  if (ctx.account.kind === "gmail") return false;
+  const newestFirst =
+    sort.length === 0 || (sort.length === 1 && sort[0]!.property === "receivedAt" && sort[0]!.isAscending === false);
+  if (!newestFirst) return false;
+  // The window's SINCE/BEFORE would replace the filter's own.
+  if (imapFilter.since !== undefined || imapFilter.before !== undefined) return false;
+  // Post-filters that drop ids after the search; kept on the plain path.
+  if (findHasAttachment(filter) !== null || findNoneInThreadHaveKeyword(filter)) return false;
+  return hasFullTextTerm(filter);
+}
+
+function windowedSearch(imapFilter: ImapSearch, window: DateWindow | undefined): ImapSearch {
+  if (!window) return imapFilter;
+  return {
+    ...imapFilter,
+    ...(window.since ? { since: window.since } : {}),
+    ...(window.before ? { before: window.before } : {}),
+  };
+}
+
+// What a window's SEARCH result is cached under. Without a window it is the
+// filter itself, as before, so existing cache entries stay valid.
+function windowedCacheKey(filter: Filter, window: DateWindow | undefined): unknown {
+  if (!window) return filter;
+  return { filter, window: [window.since?.toISOString() ?? null, window.before?.toISOString() ?? null] };
 }
 
 interface SortSpec { property: string; isAscending?: boolean; keyword?: string }
@@ -590,6 +707,7 @@ async function emailQuerySingleMailboxFull(
   sort: SortSpec[],
   ascending: boolean,
   needsFetch: boolean,
+  window?: DateWindow,
 ): Promise<{ ids: string[]; queryState: string }> {
   const m = decodeMailboxId(inMailbox);
   const mboxRow = ctx.store
@@ -605,14 +723,14 @@ async function emailQuerySingleMailboxFull(
     const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
     const emailState = viewState(ctx, ctx.client);
 
-    const cacheKey = searchCacheKey(ctx.account.id, m.mailboxIdx, uidvalidity, filter);
+    const cacheKey = searchCacheKey(ctx.account.id, m.mailboxIdx, uidvalidity, windowedCacheKey(filter, window));
     let uids: number[] | null = null;
     const cached = searchCache.get(cacheKey);
     if (cached && cached.modseq === modseq && cached.emailState === emailState && cached.expiresAt > Date.now()) {
       uids = cached.uids;
     }
     if (!uids) {
-      const searchResult = await ctx.client.search(imapFilter, { uid: true });
+      const searchResult = await ctx.client.search(windowedSearch(imapFilter, window), { uid: true });
       uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
       searchCache.set(cacheKey, {
         uids,
@@ -816,6 +934,7 @@ async function emailQueryAccountWideFull(
   sort: SortSpec[],
   ascending: boolean,
   needsFetch: boolean,
+  window?: DateWindow,
 ): Promise<{ ids: string[]; queryState: string }> {
   const otherThan = findInMailboxOtherThan(filter);
   const excludedIdxs = new Set<number>();
@@ -854,7 +973,7 @@ async function emailQueryAccountWideFull(
   // change. Without it (LIST failed, or a server without CONDSTORE) every
   // folder is searched, as before.
   const snapshot = await folderSnapshot(ctx, emailState);
-  const filterHash = createHash("sha256").update(stableHash(filter)).digest("hex");
+  const filterHash = createHash("sha256").update(stableHash(windowedCacheKey(filter, window))).digest("hex");
 
   const targets: Array<{ idx: number; row: MboxRow }> = [];
   for (const m of all) {
@@ -901,7 +1020,7 @@ async function emailQueryAccountWideFull(
       const modseq = Number((status as { highestModseq?: bigint } | null)?.highestModseq ?? 0n);
       const emailState = viewState(ctx, client);
 
-      const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, filter);
+      const cacheKey = searchCacheKey(ctx.account.id, idx, uidvalidity, windowedCacheKey(filter, window));
       let uids: number[] | null = null;
       const cached = searchCache.get(cacheKey);
       if (cached && cached.modseq === modseq && cached.emailState === emailState && cached.expiresAt > Date.now()) {
@@ -915,7 +1034,7 @@ async function emailQueryAccountWideFull(
         if (prev && sameFolderStatus(prev, live)) uids = prev.uids;
       }
       if (!uids) {
-        const searchResult = await client.search(imapFilter, { uid: true });
+        const searchResult = await client.search(windowedSearch(imapFilter, window), { uid: true });
         uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
         searchCache.set(cacheKey, {
           uids,
