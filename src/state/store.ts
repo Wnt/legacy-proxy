@@ -1,6 +1,7 @@
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { Database as DB, Statement } from "better-sqlite3";
+import { hasPointerNotice, pointerWords } from "../mapping/html-pointer.js";
 
 export interface AccountRow {
   id: number;
@@ -295,6 +296,35 @@ export class Store {
           this.db.pragma(`user_version = ${v}`);
         })();
       }
+    }
+    // v6: a plain-text part that only points to the HTML alternative ("This
+    // newsletter is in HTML. Read it at <link>") previews from the HTML
+    // part. Only the cached previews that hold such a notice are forgotten.
+    if ((this.db.pragma("user_version", { simple: true }) as number) < 6) {
+      this.db.transaction(() => {
+        this.forgetPreviewsWhere((preview) => hasPointerNotice(pointerWords(preview)));
+        this.db.pragma("user_version = 6");
+      })();
+    }
+  }
+
+  // Forget the cached previews `test` picks, and move the Email state of the
+  // accounts that had one, so their clients refetch what they list.
+  private forgetPreviewsWhere(test: (preview: string) => boolean): void {
+    const hits: { account_id: number; mailbox_id: number; uid: number }[] = [];
+    const rows = this.db
+      .prepare(`SELECT account_id, mailbox_id, uid, preview FROM email_cache WHERE preview IS NOT NULL AND preview <> ''`)
+      .iterate() as IterableIterator<{ account_id: number; mailbox_id: number; uid: number; preview: string }>;
+    for (const r of rows) if (test(r.preview)) hits.push(r);
+    if (hits.length === 0) return;
+    const forget = this.db.prepare(`UPDATE email_cache SET preview = NULL WHERE account_id = ? AND mailbox_id = ? AND uid = ?`);
+    for (const h of hits) forget.run(h.account_id, h.mailbox_id, h.uid);
+    const now = Date.now();
+    const move = this.db.prepare(`UPDATE state_log SET state = state + 1, at = ? WHERE account_id = ? AND kind = 'email'`);
+    const add = this.db.prepare(`INSERT OR IGNORE INTO state_log(account_id, kind, state, at) VALUES(?, 'email', 1, ?)`);
+    for (const accountId of new Set(hits.map((h) => h.account_id))) {
+      move.run(now, accountId);
+      add.run(accountId, now);
     }
   }
 

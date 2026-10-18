@@ -250,7 +250,7 @@ describe("cache upgrade to v5", () => {
     expect(row).toMatchObject({ preview: null, thread_id: "T1" });
     expect(row.envelope).toBeTruthy();
     expect(store.getState(1, "email")).toBeGreaterThan(before);
-    expect(store.db.pragma("user_version", { simple: true })).toBe(5);
+    expect(store.db.pragma("user_version", { simple: true })).toBeGreaterThanOrEqual(5);
     // The next read computes the preview again and caches it.
     const got = await fetchEmailsBatch(server(leaf("1", HTML), { "1": HTML }), account, mailbox, [7], {}, store);
     expect(got.get(7)!.preview).toBe(htmlPreview(NEWSLETTER));

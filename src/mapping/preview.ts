@@ -3,6 +3,7 @@
 // prefix of one body part, so everything here must cope with input cut short
 // anywhere - inside a <style> element, a comment, a tag or a CSS rule.
 import { Parser } from "htmlparser2";
+import { isHtmlPointer, pointerFallback } from "./html-pointer.js";
 
 export const PREVIEW_MAX_CHARS = 256;
 
@@ -338,4 +339,24 @@ export function htmlPreview(html: string): string {
 
 export function buildPreview(text: string, isHtml: boolean): string {
   return isHtml ? htmlPreview(text) : plainPreview(text);
+}
+
+/**
+ * Preview of a message's text/plain part, given whether the message also has
+ * an HTML alternative of it (multipart/alternative). `useHtml` says the
+ * preview should come from that HTML part instead: the text part yields
+ * nothing, or it only points to the HTML version ("This newsletter is in
+ * HTML. Read it at <link>"). `fallback` is then the preview to use when the
+ * HTML part has no text either: empty, or the stub's notice kept short.
+ */
+export function textPartPreview(
+  text: string,
+  hasHtmlAlternative: boolean,
+): { preview: string; useHtml: boolean; fallback: string } {
+  const preview = plainPreview(text);
+  if (preview === "") return { preview, useHtml: true, fallback: "" };
+  if (hasHtmlAlternative && !looksLikeHtml(text) && isHtmlPointer(text)) {
+    return { preview, useHtml: true, fallback: pointerFallback(text) };
+  }
+  return { preview, useHtml: false, fallback: preview };
 }

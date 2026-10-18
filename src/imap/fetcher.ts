@@ -4,7 +4,7 @@ import type { FetchMessageObject, ImapFlow } from "imapflow";
 // @ts-expect-error no declaration file
 import libqp from "libqp";
 import { selectBodies, structureToBodyParts, type EmailBodyPart } from "../mapping/structure.js";
-import { buildPreview } from "../mapping/preview.js";
+import { buildPreview, textPartPreview } from "../mapping/preview.js";
 import { flagsToKeywords } from "../mapping/flags.js";
 import { encodeBlobId, encodeEmailId, encodeMailboxId } from "../mapping/ids.js";
 import {
@@ -274,14 +274,23 @@ const PREVIEW_FETCH_BUDGET = 16 * 1024 * 1024;
 // The parts a preview is made from: the first text/plain part (or other
 // non-HTML text part) of the text body, else the first HTML part. Chosen by
 // type, not by list, since an HTML-only message may list its HTML part in
-// textBody as well (RFC 8621 §4.1.4).
-function previewParts(sel: ReturnType<typeof selectBodies>): { text: EmailBodyPart | null; html: EmailBodyPart | null } {
+// textBody as well (RFC 8621 §4.1.4). `alternative` says the two are the
+// plain and HTML versions of one multipart/alternative: each is in its own
+// list only (§4.1.4 puts parts outside an alternative in both).
+function previewParts(sel: ReturnType<typeof selectBodies>): {
+  text: EmailBodyPart | null;
+  html: EmailBodyPart | null;
+  alternative: boolean;
+} {
   const text = sel.textBody.find((b) => b.partId && b.type !== "text/html") ?? null;
   const html =
     sel.htmlBody.find((b) => b.partId && b.type === "text/html") ??
     sel.textBody.find((b) => b.partId && b.type === "text/html") ??
     null;
-  return { text, html };
+  const alternative =
+    text !== null && html !== null && text.type === "text/plain" &&
+    !sel.htmlBody.includes(text) && !sel.textBody.includes(html);
+  return { text, html, alternative };
 }
 
 // Envelope as imapflow parses it. When rehydrated from the cache the Date
@@ -717,7 +726,8 @@ async function fetchBodyValuesBatched(
 // Fetch preview snippets for the given messages, batching one FETCH per
 // distinct (part id, length) (typically one or two groups per page). A
 // plain-text part that yields no preview (empty, or nothing but a leftover
-// style sheet) falls back to the message's HTML part in a second round.
+// style sheet), or that only points to the HTML alternative, falls back to
+// the message's HTML part in a second round.
 async function fetchPreviewsBatched(
   client: ImapFlow,
   targets: ProcessedMeta[],
@@ -728,27 +738,37 @@ async function fetchPreviewsBatched(
     isHtml: boolean;
     maxLength: number;
     fallback: EmailBodyPart | null;
+    alternative: boolean;
+    // The preview when an HTML part fetched as the fallback has no text.
+    orElse: string;
   }
   const out = new Map<number, string>();
   let budget = PREVIEW_FETCH_BUDGET;
-  const task = (uid: number, part: EmailBodyPart, isHtml: boolean, fallback: EmailBodyPart | null): PreviewTask | null => {
+  const task = (
+    uid: number,
+    part: EmailBodyPart,
+    isHtml: boolean,
+    fallback: EmailBodyPart | null,
+    alternative = false,
+    orElse = "",
+  ): PreviewTask | null => {
     const cap = isHtml ? PREVIEW_HTML_FETCH_BYTES : PREVIEW_TEXT_FETCH_BYTES;
     const maxLength = part.size > 0 ? Math.min(part.size, cap) : cap;
     if (maxLength > budget) return null; // no preview this time, and none cached
     budget -= maxLength;
-    return { uid, part, isHtml, maxLength, fallback };
+    return { uid, part, isHtml, maxLength, fallback, alternative, orElse };
   };
 
   let tasks: PreviewTask[] = [];
   for (const p of targets) {
-    const { text, html } = previewParts(p.sel);
+    const { text, html, alternative } = previewParts(p.sel);
     const part = text ?? html;
     if (!part) {
       // No previewable part at all: the empty preview is final, cacheable.
       out.set(p.raw.uid, "");
       continue;
     }
-    const t = task(p.raw.uid, part, part === html, part === html ? null : html);
+    const t = task(p.raw.uid, part, part === html, part === html ? null : html, alternative);
     if (t) tasks.push(t);
   }
 
@@ -776,13 +796,18 @@ async function fetchPreviewsBatched(
           const t = taskByUid.get(m.uid);
           if (!buf || !t) continue;
           const decoded = decodeTransferEncoding(buf, t.part.encoding);
-          const preview = buildPreview(decodePartText(decoded, t.part.charset), t.isHtml);
-          if (preview === "" && t.fallback) {
-            const next = task(t.uid, t.fallback, true, null);
+          const value = decodePartText(decoded, t.part.charset);
+          if (t.isHtml) {
+            out.set(m.uid, buildPreview(value, true) || t.orElse);
+            continue;
+          }
+          const pick = textPartPreview(value, t.alternative);
+          if (pick.useHtml && t.fallback) {
+            const next = task(t.uid, t.fallback, true, null, false, pick.fallback);
             if (next) retry.push(next);
             continue;
           }
-          out.set(m.uid, preview);
+          out.set(m.uid, pick.preview);
         }
       } catch (e) {
         // best-effort: leave preview empty (and uncached) for this group
@@ -964,11 +989,25 @@ export async function fetchEmailsBatch(
         if (previewByUid.has(p.raw.uid)) continue;
         const values = bodyValuesByUid.get(p.raw.uid) ?? {};
         let preview = "";
-        const { text, html } = previewParts(p.sel);
+        let orElse = "";
+        const { text, html, alternative } = previewParts(p.sel);
         const textValue = text ? values[text.partId!] : undefined;
         const htmlValue = html ? values[html.partId!] : undefined;
-        if (textValue) preview = buildPreview(textValue.value, false);
-        if (!preview && htmlValue) preview = buildPreview(htmlValue.value, true);
+        if (textValue) {
+          const pick = textPartPreview(textValue.value, alternative);
+          // A pointer verdict needs the whole part, or as much of it as a
+          // preview FETCH reads; a shorter cut value leaves it to that FETCH.
+          if (pick.useHtml && pick.fallback && textValue.isTruncated && textValue.value.length < PREVIEW_TEXT_FETCH_BYTES) continue;
+          preview = pick.useHtml ? "" : pick.preview;
+          orElse = pick.fallback;
+        }
+        if (!preview && htmlValue) {
+          preview = buildPreview(htmlValue.value, true);
+          // An HTML value cut shorter than a preview FETCH reads may have its
+          // text past the cut; that FETCH decides then.
+          const cutShort = htmlValue.isTruncated && htmlValue.value.length < PREVIEW_HTML_FETCH_BYTES;
+          if (!preview && !cutShort) preview = orElse;
+        }
         if (preview) previewByUid.set(p.raw.uid, preview);
       }
     }
