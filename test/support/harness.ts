@@ -7,6 +7,7 @@ import path from "node:path";
 import { vi } from "vitest";
 import type { Store, AccountRow } from "../../src/state/store.js";
 import type { ImapPool } from "../../src/imap/pool.js";
+import type { RequestBudgets } from "../../src/imap/fetcher.js";
 import type { MethodCall } from "../../src/jmap/router.js";
 import { sealCredentials } from "../../src/auth/credentials.js";
 import type { AppConfig } from "../../src/util/config.js";
@@ -18,6 +19,11 @@ export const USING = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"];
 // harness gets ids no earlier harness in the same file used.
 let accountSeq = 0;
 
+export interface RequestOpts {
+  signal?: AbortSignal;
+  budgets?: RequestBudgets;
+}
+
 export interface Harness {
   imap: FakeImapServer;
   store: Store;
@@ -26,9 +32,10 @@ export interface Harness {
   account: AccountRow;
   accountId: string;
   dir: string;
-  jmap(calls: MethodCall[]): Promise<MethodCall[]>;
+  /** One request; `signal` is its client going away, `budgets` its allowances (default: fresh). */
+  jmap(calls: MethodCall[], opts?: RequestOpts): Promise<MethodCall[]>;
   /** One method call; throws on a JMAP error response. */
-  call<T = Record<string, unknown>>(name: string, args: Record<string, unknown>): Promise<T>;
+  call<T = Record<string, unknown>>(name: string, args: Record<string, unknown>, opts?: RequestOpts): Promise<T>;
   mailboxIds(): Promise<Record<string, string>>;
   /** A process restart: fresh modules (empty in-memory caches), a new Store and pool on the same data dir. */
   restart(): Promise<void>;
@@ -91,19 +98,19 @@ export async function startHarness(imap: FakeImapServer): Promise<Harness> {
     account,
     accountId: String(account.id),
     dir,
-    async jmap(calls) {
+    async jmap(calls, opts) {
       const out = await mods.dispatch(
         { using: USING, methodCalls: calls },
         {
-          methods: mods.makeLegacyMethods({ cfg, pool, store, account, dispatcher: {} as never }),
+          methods: mods.makeLegacyMethods({ cfg, pool, store, account, dispatcher: {} as never, signal: opts?.signal, budgets: opts?.budgets }),
           maxCallsInRequest: 64,
           sessionState: "s",
         },
       );
       return out.methodResponses;
     },
-    async call(name, args) {
-      const [r] = await h.jmap([[name, { accountId: h.accountId, ...args }, "c"]]);
+    async call(name, args, opts) {
+      const [r] = await h.jmap([[name, { accountId: h.accountId, ...args }, "c"]], opts);
       if (r![0] === "error") throw new Error(`${name}: ${JSON.stringify(r![1])}`);
       return r![1] as never;
     },

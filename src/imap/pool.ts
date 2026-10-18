@@ -6,6 +6,7 @@ import { openCredentials } from "../auth/credentials.js";
 import { openImap } from "./client.js";
 import type { Store, AccountRow } from "../state/store.js";
 import { log } from "../util/log.js";
+import { checkAborted, RequestAbortedError } from "./abort.js";
 
 interface PoolEntry {
   client: ImapFlow;
@@ -120,14 +121,15 @@ export class ImapPool {
 
   /**
    * Borrow a connection for the duration of `fn`. The connection returns to
-   * the pool whether `fn` resolves or throws.
+   * the pool whether `fn` resolves or throws. With `signal`, see `acquire`.
    */
   async withConnection<T>(
     account: AccountRow,
     role: PoolRole,
     fn: (client: ImapFlow) => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
-    const lease = await this.acquire(account, role);
+    const lease = await this.acquire(account, role, signal);
     try {
       return await fn(lease.client);
     } finally {
@@ -139,12 +141,25 @@ export class ImapPool {
    * Borrow a connection with an explicit release. Prefer `withConnection`;
    * this exists for callers whose use outlives a single async scope, such as
    * the blob download route streaming a response body.
+   *
+   * With `signal`, a caller whose request is abandoned while it waits leaves
+   * the queue at once, and a connection it obtains after that is given back
+   * unused: nothing queued for a request that has gone starts afterwards.
    */
-  async acquire(account: AccountRow, role: PoolRole = "interactive"): Promise<Lease> {
+  async acquire(account: AccountRow, role: PoolRole = "interactive", signal?: AbortSignal): Promise<Lease> {
     const key = `${account.id}:${role}`;
     for (;;) {
-      const got = await this.takeFree(account, key, role);
-      if ("entry" in got) return this.leaseFor(key, got.entry);
+      checkAborted(signal);
+      const got = await this.takeFree(account, key, role, signal);
+      if ("entry" in got) {
+        const lease = this.leaseFor(key, got.entry);
+        // Aborted while a NOOP or the LOGIN of a new connection ran.
+        if (signal?.aborted) {
+          lease.release();
+          throw new RequestAbortedError();
+        }
+        return lease;
+      }
       // At the cap with everything busy: park until someone releases, then
       // re-run the whole selection (the freed entry may have died meanwhile).
       // takeFree registered the wait in the same synchronous step as the cap
@@ -162,6 +177,7 @@ export class ImapPool {
     account: AccountRow,
     key: string,
     role: PoolRole,
+    signal?: AbortSignal,
   ): Promise<{ entry: PoolEntry } | { wait: Promise<void> }> {
     const list = [...(this.entries.get(key) ?? [])];
     for (const entry of list) {
@@ -201,7 +217,7 @@ export class ImapPool {
       // A connection released while we awaited a NOOP above woke nobody (we
       // weren't queued yet): take another pass instead of parking.
       const freed = (this.entries.get(key) ?? []).some((e) => !e.busy && e.client.usable);
-      return { wait: freed ? Promise.resolve() : this.waitForRelease(key) };
+      return { wait: freed ? Promise.resolve() : this.waitForRelease(key, signal) };
     }
     this.opening.set(key, (this.opening.get(key) ?? 0) + 1);
     let entry: PoolEntry;
@@ -224,7 +240,7 @@ export class ImapPool {
         this.refusedCap.set(key, { cap: established, until: Date.now() + REFUSED_CAP_MS });
         log.warn({ key, cap: established, err: (e as Error).message }, "imap connection refused; capping the role");
         const freed = (this.entries.get(key) ?? []).some((x) => !x.busy && x.client.usable);
-        return { wait: freed ? Promise.resolve() : this.waitForRelease(key) };
+        return { wait: freed ? Promise.resolve() : this.waitForRelease(key, signal) };
       }
       // The slot is free again: let a parked caller try to open it.
       this.wake(key);
@@ -279,14 +295,31 @@ export class ImapPool {
     };
   }
 
-  private waitForRelease(key: string): Promise<void> {
+  private waitForRelease(key: string, signal?: AbortSignal): Promise<void> {
     const queue = this.waiters.get(key) ?? [];
     // Each parked caller is a request holding memory; past this many, fail
     // fast instead of queueing without bound.
     if (queue.length >= MAX_WAITERS) throw new PoolBusyError(key);
-    return new Promise<void>((resolve) => {
-      queue.push(resolve);
+    checkAborted(signal);
+    return new Promise<void>((resolve, reject) => {
+      const wake = () => {
+        signal?.removeEventListener("abort", leave);
+        resolve();
+      };
+      // An abandoned caller leaves its place in the queue rather than waiting
+      // for a connection it would only give back.
+      const leave = () => {
+        const q = this.waiters.get(key);
+        const i = q ? q.indexOf(wake) : -1;
+        if (i >= 0) {
+          q!.splice(i, 1);
+          if (q!.length === 0) this.waiters.delete(key);
+        }
+        reject(new RequestAbortedError());
+      };
+      queue.push(wake);
       this.waiters.set(key, queue);
+      signal?.addEventListener("abort", leave, { once: true });
     });
   }
 

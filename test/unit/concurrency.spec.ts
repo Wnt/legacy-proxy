@@ -47,6 +47,25 @@ describe("mapWithConcurrency", () => {
     expect(await mapWithConcurrency([], 4, async () => 1)).toEqual([]);
   });
 
+  it("starts no item after one failed, and rejects once the running ones settled", async () => {
+    const started: number[] = [];
+    let running = 0;
+    let settledAtReject = -1;
+    const p = mapWithConcurrency(Array.from({ length: 10 }, (_, i) => i), 3, async (i) => {
+      started.push(i);
+      running++;
+      try {
+        await tick(i === 0 ? 5 : 30);
+        if (i === 0) throw new Error("over budget");
+      } finally {
+        running--;
+      }
+    });
+    await expect(p.catch((e) => ((settledAtReject = running), Promise.reject(e)))).rejects.toThrow("over budget");
+    expect(started).toEqual([0, 1, 2]);
+    expect(settledAtReject).toBe(0);
+  });
+
   it("propagates a rejection from one item", async () => {
     await expect(
       mapWithConcurrency([1, 2, 3], 2, async (n) => {

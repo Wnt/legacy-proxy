@@ -135,7 +135,8 @@ Changes from upstream:
     report the same one. A client that disconnects stops its request: it
     leaves the per-account queue, and Email/get and draft creation stop at
     their next step (also mid-download of an attachment, and before the
-    draft is built or appended). A draft's
+    draft is built or appended); see also *Queries are budgeted* below for
+    commands the server stops answering. A draft's
     MIME is built from at most 50 MB (the advertised
     `maxSizeAttachmentsPerEmail`) of blobs and body values: `mimeContentPlan`
     counts every occurrence the builder will encode, the way it decides, and
@@ -165,11 +166,36 @@ Changes from upstream:
     back if the open fails. A caller that finds every slot busy registers its
     wait in that same step (after re-checking for a connection released while
     it awaited a NOOP), so a release can't slip past it. At most 64 callers
-    wait per account and role; queued callers can't be cancelled.
+    wait per account and role; a caller whose request is abandoned leaves the
+    queue, and a connection it obtains after that goes back unused.
     JMAP API requests are limited per account to the advertised
     `maxConcurrentRequests` (10); up to 40 more wait, and beyond that the
     request gets the RFC 8620 `limit` error, which clients back off from.
     Code: `src/imap/pool.ts`, `src/util/limiter.ts`, `src/server.ts`.
+  - *Queries are budgeted, and abandoned reads stop.* Email/query and
+    Email/queryChanges, in one folder or across all of them, draw on the
+    request's budgets like Email/get: every matching message costs 100 units
+    when the SEARCH result is in, and its sort keys and flags as they arrive,
+    from a 64 Mi-unit allowance per request (some 650,000 date-sorted
+    messages) shared by all its queries. Past it the call fails with
+    `requestTooLarge`, never a shorter list, and an account-wide query stops
+    its folder workers: no folder starts after a failure, and the ones
+    running are awaited before the call answers. Sorts fetch only what they
+    compare (RFC822.SIZE for `size`, FLAGS for `hasKeyword`, the ENVELOPE
+    only for `from`, `to`, `subject` and `sentAt`). A failed SEARCH is an
+    error, not an empty (and cached) result. When the request's client goes
+    away, a SELECT, SEARCH, FETCH or download it has on a connection is cut
+    off by closing that connection (the read stream is destroyed too), so a
+    server that stopped answering no longer holds the request; this covers
+    Email/query, Email/get, blob reads for drafts and the download route
+    before it streams. A full-text search joined by several requests runs on
+    while any of them waits; when the last one leaves it keeps running for
+    10 s, for a client that asks again after its proxy gave up, and is then
+    stopped. The in-memory SEARCH caches hold at most 2 million UIDs each.
+    Code: `src/imap/abort.ts`, `src/imap/pool.ts`,
+    `src/jmap/methods/email.ts`, `src/jmap/blobs.ts`, `src/server.ts`,
+    `src/util/concurrency.ts`. Tests:
+    `test/unit/security-query-cancel.spec.ts`.
   - *Session tokens are schema-checked.* A signed payload must have non-empty
     string `accountSlug` and `username`, integer `iat` and `exp`, `exp` in the
     future, `iat` not in the future, and a lifetime of at most 7 days. The

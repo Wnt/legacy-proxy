@@ -176,10 +176,13 @@ function makeMethodTable(): Record<string, Handler> {
       c.pool.withConnection(c.account, "interactive", (client) =>
         mailboxSet(a as never, { account: c.account, client, store: c.store }),
       ),
+    // The read methods take the request's budgets and abort signal: an
+    // abandoned request gives up its place in the connection queue and stops
+    // its folder workers and FETCHes.
     "Email/query": async (a, c) => {
       const res = await c.pool.withConnection(c.account, "interactive", (client) =>
-        emailQuery(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
-      );
+        emailQuery(a as never, { account: c.account, client, store: c.store, pool: c.pool, budgets: c.budgets }),
+      c.signal);
       // The top of the INBOX list is what gets opened next: warm it.
       if (isInboxFirstPage(a, c.store, c.account.id)) prefetchEmails(c.pool, c.store, c.account, res.ids);
       return res;
@@ -191,17 +194,19 @@ function makeMethodTable(): Record<string, Handler> {
           maxObjectsInGet: c.cfg.limits.maxObjectsInGet,
           budgets: c.budgets,
         }),
-      ),
+      c.signal),
+    // Mutations stop once the request is abandoned (emailSet), so it doesn't
+    // start one either.
     "Email/set": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
         emailSet(a as never, { account: c.account, client, store: c.store, pool: c.pool, budgets: c.budgets }),
-      ),
+      c.signal),
     "Email/changes": async (a, c) =>
       emailChanges(a as never, { account: c.account, store: c.store }),
     "Email/queryChanges": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
-        emailQueryChanges(a as never, { account: c.account, client, store: c.store, pool: c.pool }),
-      ),
+        emailQueryChanges(a as never, { account: c.account, client, store: c.store, pool: c.pool, budgets: c.budgets }),
+      c.signal),
     "Email/copy": async (a, c) =>
       c.pool.withConnection(c.account, "interactive", (client) =>
         emailCopy(a as never, { account: c.account, client, store: c.store }),
@@ -266,7 +271,7 @@ const TABLE = makeMethodTable();
 
 /** Bind the legacy transports to the authenticated account for one request. */
 // Called once per HTTP request, so the request's method calls share one set
-// of Email/get budgets.
+// of budgets (Email/get, Email/query, Email/queryChanges).
 export function makeLegacyMethods(ctx: LegacyContext): MethodTable {
   const budgets = ctx.budgets ?? newRequestBudgets();
   if (ctx.signal) budgets.signal = ctx.signal;

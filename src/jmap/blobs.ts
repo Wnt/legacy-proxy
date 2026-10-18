@@ -4,10 +4,11 @@
 
 import type { ImapFlow } from "imapflow";
 import { Buffer } from "node:buffer";
+import type { Readable } from "node:stream";
 import { selectedUidValidity, withMailbox } from "../imap/client.js";
 import type { ImapPool } from "../imap/pool.js";
 import { decodeBlobId, decodeEmailId } from "../mapping/ids.js";
-import { checkAborted } from "../imap/fetcher.js";
+import { abortable, checkAborted, RequestAbortedError } from "../imap/abort.js";
 import type { AccountRow, Store } from "../state/store.js";
 
 // Above the 50 MB attachment and upload limits, with room for a whole message
@@ -62,34 +63,46 @@ export async function readBlob(
     withMailbox(client, mbox.name, async () => {
       // A blob id from another UIDVALIDITY epoch names a message that is gone.
       if (selectedUidValidity(client) !== email.uidvalidity) return null;
-      const dl = await client.download(`${email.uid}`, part.partId ?? undefined, { uid: true });
-      // imapflow answers `{}` rather than null for an expunged message or part.
-      if (!dl?.content) return null;
-      const chunks: Buffer[] = [];
-      let total = 0;
-      try {
-        for await (const chunk of dl.content) {
-          total += (chunk as Buffer).length;
-          // Everything read here is held in memory (and then MIME-encoded
-          // again), so cap it; mail this large cannot be sent anyway.
-          if (total > limit) throw new BlobTooLargeError(blobId);
-          // The request was abandoned: stop downloading (the connection is
-          // closed below, since the FETCH is cut off mid-literal).
+      // An abandoned request closes the connection (abortable), which cuts off
+      // a FETCH the server has stopped answering, and destroys the stream, so
+      // a read waiting for its next chunk wakes up too.
+      return abortable(client, signal, async () => {
+        const dl = await client.download(`${email.uid}`, part.partId ?? undefined, { uid: true });
+        // imapflow answers `{}` rather than null for an expunged message or part.
+        if (!dl?.content) return null;
+        const content = dl.content as Readable;
+        const stop = () => content.destroy?.(new RequestAbortedError());
+        signal?.addEventListener("abort", stop, { once: true });
+        const chunks: Buffer[] = [];
+        let total = 0;
+        try {
           checkAborted(signal);
-          chunks.push(chunk as Buffer);
+          for await (const chunk of content) {
+            total += (chunk as Buffer).length;
+            // Everything read here is held in memory (and then MIME-encoded
+            // again), so cap it; mail this large cannot be sent anyway.
+            if (total > limit) throw new BlobTooLargeError(blobId);
+            checkAborted(signal);
+            chunks.push(chunk as Buffer);
+          }
+        } catch (e) {
+          // A FETCH that broke off mid-literal leaves the connection
+          // unparseable, so drop it rather than pool it.
+          content.destroy?.();
+          client.close();
+          throw e;
+        } finally {
+          signal?.removeEventListener("abort", stop);
         }
-      } catch (e) {
-        // A FETCH that broke off mid-literal leaves the connection
-        // unparseable, so drop it rather than pool it.
-        client.close();
-        throw e;
-      }
-      return {
-        body: Buffer.concat(chunks),
-        ctype: part.partId ? dl.meta?.contentType ?? "application/octet-stream" : "message/rfc822",
-      };
-    });
+        return {
+          body: Buffer.concat(chunks),
+          ctype: part.partId ? dl.meta?.contentType ?? "application/octet-stream" : "message/rfc822",
+        };
+      });
+    }, signal);
   // Like the download route, fetch on the bulk connection so a large
-  // forwarded attachment doesn't hold up the account's interactive calls.
-  return ctx.pool ? ctx.pool.withConnection(ctx.account, "bulk", fetch) : fetch(ctx.client);
+  // forwarded attachment doesn't hold up the account's interactive calls. A
+  // lease that comes free after the request was abandoned is given back
+  // unused (ImapPool.acquire).
+  return ctx.pool ? ctx.pool.withConnection(ctx.account, "bulk", fetch, signal) : fetch(ctx.client);
 }

@@ -136,6 +136,14 @@ export class FakeImapServer {
   maxConnections = Infinity;
   /** Holds a command this long before answering it (e.g. a slow full-text SEARCH). Commands on one connection stay in order. */
   commandDelayMs: ((line: string) => number) | null = null;
+  /**
+   * Holds a command until the promise returned for it settles; one that never
+   * settles is a server that stopped answering. Commands on one connection
+   * stay in order.
+   */
+  commandGate: ((line: string, conn: number) => Promise<unknown> | null) | null = null;
+  /** Connections the client side closed (socket ended or destroyed), by number. */
+  closedConns = new Set<number>();
   private server: net.Server | null = null;
   private sockets = new Set<net.Socket>();
   port = 0;
@@ -210,7 +218,10 @@ export class FakeImapServer {
   private session(sock: net.Socket): void {
     const conn = ++this.connections;
     this.sockets.add(sock);
-    sock.on("close", () => this.sockets.delete(sock));
+    sock.on("close", () => {
+      this.sockets.delete(sock);
+      this.closedConns.add(conn);
+    });
     sock.on("error", () => {});
     let selected: FakeFolder | null = null;
     let buf = Buffer.alloc(0);
@@ -257,9 +268,11 @@ export class FakeImapServer {
           }
         };
         const delay = this.commandDelayMs?.(full) ?? 0;
-        if (delay > 0 || queued) {
+        const gate = this.commandGate?.(full, conn) ?? null;
+        if (delay > 0 || gate || queued) {
           const next: Promise<unknown> = (queued ?? Promise.resolve())
             .then(() => (delay > 0 ? new Promise((r) => setTimeout(r, delay)) : undefined))
+            .then(() => gate?.catch(() => {}))
             .then(run);
           queued = next;
           void next.then(() => {

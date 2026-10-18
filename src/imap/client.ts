@@ -2,6 +2,7 @@ import { ImapFlow } from "imapflow";
 import type { Credentials } from "../auth/credentials.js";
 import type { ProviderConfig } from "../util/config.js";
 import { log } from "../util/log.js";
+import { abortable } from "./abort.js";
 
 export interface ImapConnOpts {
   provider: ProviderConfig;
@@ -65,8 +66,10 @@ export async function withMailbox<T>(
   client: ImapFlow,
   path: string,
   fn: (lock: { release: () => void }) => Promise<T>,
+  // The request's: a SELECT the server does not answer is cut off (abortable).
+  signal?: AbortSignal,
 ): Promise<T> {
-  const lock = await client.getMailboxLock(path);
+  const lock = await abortable(client, signal, () => client.getMailboxLock(path));
   try {
     return await fn({ release: () => lock.release() });
   } finally {

@@ -18,6 +18,7 @@ import {
 } from "./headers.js";
 import { imapErrorDetails } from "./client.js";
 import { fetchByUid } from "./uids.js";
+import { BudgetExceededError, checkAborted } from "./abort.js";
 import type { AccountRow, MailboxRow, Store, EmailCacheUpsert } from "../state/store.js";
 import { log } from "../util/log.js";
 import { storeBodyCache, type BodyCache } from "./bodycache.js";
@@ -102,16 +103,15 @@ export interface RequestBudgets {
   response: { remaining: number };
   // ENVELOPE + BODYSTRUCTURE JSON characters held for this request's messages.
   metadata: { remaining: number };
+  // What Email/query and Email/queryChanges hold for this request's queries
+  // before a page is cut from them: one charge per matching message plus its
+  // sort keys and flags (chargeQueryHits), over every mailbox and call.
+  query: { remaining: number };
   // Set when the client went away: work stops at the next check.
   signal?: AbortSignal;
 }
 
-/** A RequestBudgets allowance ran out (or the request was abandoned). */
-export class BudgetExceededError extends Error {}
-
-export function checkAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) throw new BudgetExceededError("request aborted by the client");
-}
+export { BudgetExceededError, RequestAbortedError, checkAborted } from "./abort.js";
 
 function chargeMetadata(budget: { remaining: number } | undefined, chars: number): void {
   if (!budget) return;
@@ -132,7 +132,24 @@ export function newRequestBudgets(): RequestBudgets {
     projection: { remaining: MAX_FULL_HEADER_BYTES_PER_CALL },
     response: { remaining: MAX_RESPONSE_CHARS },
     metadata: { remaining: MAX_METADATA_CHARS },
+    query: { remaining: MAX_QUERY_UNITS },
   };
+}
+
+// What one matching message costs a query, before its sort keys and flags: its
+// UID in the SEARCH result, the hit record and its id string, about 100 bytes.
+export const QUERY_HIT_UNITS = 100;
+// The query allowance of one request: some 650,000 matching messages sorted by
+// date (every message of a large account, as an "All mail" view lists them),
+// fewer with subject, address or keyword sorts.
+export const MAX_QUERY_UNITS = 64 * 1024 * 1024;
+
+/** Charge `units` to the request's query allowance; throws once it is spent. */
+export function chargeQuery(budgets: RequestBudgets, units: number): void {
+  budgets.query.remaining -= units;
+  if (budgets.query.remaining < 0) {
+    throw new BudgetExceededError(`query results exceed ${MAX_QUERY_UNITS} units for one request; narrow the filter`);
+  }
 }
 
 // Characters of Email objects all Email/get calls of one request may return,
@@ -689,7 +706,9 @@ async function fetchBodyValuesBatched(
         }
       }
     } catch (e) {
-      // An abandoned request stops here; only IMAP failures are best-effort.
+      // An abandoned request stops here (its connection was closed under the
+      // FETCH, see abortable); only IMAP failures are best-effort.
+      checkAborted(opts.signal);
       if (e instanceof BudgetExceededError) throw e;
       // fall through: members without raw parts get isEncodingProblem below
       log.warn({ uids: g.members.map((m) => m.uid), partIds: g.parts.map((p) => p.partId), ...imapErrorDetails(e) }, "body part FETCH failed");
@@ -1014,6 +1033,9 @@ export async function fetchEmailsBatch(
     const needPreview = processed.filter((p) => !previewByUid.has(p.raw.uid));
     if (needPreview.length > 0) {
       const fetched = await fetchPreviewsBatched(client, needPreview);
+      // Previews are best-effort, so a FETCH cut off by an abandoned request
+      // (abortable) ends quietly there: stop here instead.
+      checkAborted(bodyOpts.signal);
       for (const [uid, preview] of fetched) previewByUid.set(uid, preview);
     }
     // Persist previews computed for rows that were served from cache without

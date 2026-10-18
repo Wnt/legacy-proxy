@@ -18,6 +18,7 @@ import { dispatch, type RequestEnvelope } from "./jmap/router.js";
 import { makeLegacyMethods } from "./backends/legacy.js";
 import { EventSourceHub } from "./jmap/eventsource.js";
 import { imapErrorDetails, openImap, selectedUidValidity } from "./imap/client.js";
+import { abortable } from "./imap/abort.js";
 import { PushDispatcher } from "./push/dispatcher.js";
 import { PushIdleManager } from "./push/idle.js";
 
@@ -291,9 +292,23 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
     // Both the pooled connection and the mailbox lock therefore outlive this
     // handler: they are given back when the body stream ends, not when the
     // route returns.
-    const lease = await pool.acquire(account, "bulk");
+    // A client that leaves before the part starts streaming gives up its
+    // place in the queue, and a SELECT or first FETCH the server is not
+    // answering is cut off (abortable). Once streaming, the pipeline below
+    // handles a hang-up.
+    const gone = new AbortController();
+    reply.raw.on("close", () => {
+      if (!reply.raw.writableFinished) gone.abort();
+    });
+    const lease = await pool.acquire(account, "bulk", gone.signal);
     const client = lease.client;
-    const lock = await client.getMailboxLock(mbox.name);
+    let lock: { release: () => void };
+    try {
+      lock = await abortable(client, gone.signal, () => client.getMailboxLock(mbox.name));
+    } catch (e) {
+      lease.release();
+      throw e;
+    }
     let released = false;
     const release = () => {
       if (released) return;
@@ -309,11 +324,17 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
         release();
         return reply.code(404).send({ error: "blob not found" });
       }
-      const dl = await client.download(
-        `${emailParts.uid}`,
-        parsed.partId ?? undefined,
-        { uid: true },
-      );
+      // Cut off while the first chunk is awaited; once the stream exists the
+      // pipeline below handles a hang-up (and destroys it).
+      const cutOff = () => client.close();
+      gone.signal.addEventListener("abort", cutOff, { once: true });
+      let dl: Awaited<ReturnType<typeof client.download>>;
+      try {
+        if (gone.signal.aborted) throw new Error("client went away");
+        dl = await client.download(`${emailParts.uid}`, parsed.partId ?? undefined, { uid: true });
+      } finally {
+        gone.signal.removeEventListener("abort", cutOff);
+      }
       // imapflow answers `{}` rather than null when the FETCH came back
       // without the message or part (expunged, or the server could not
       // produce it), so check for the stream itself.
@@ -386,10 +407,12 @@ app.get<{ Params: { accountId: string; blobId: string; type: string; name: strin
       return reply.send(tee);
     } catch (e) {
       release();
-      log.error(
-        { mailbox: mbox.name, uid: emailParts.uid, partId: parsed.partId ?? null, ...imapErrorDetails(e) },
-        "download error",
-      );
+      if (!gone.signal.aborted) {
+        log.error(
+          { mailbox: mbox.name, uid: emailParts.uid, partId: parsed.partId ?? null, ...imapErrorDetails(e) },
+          "download error",
+        );
+      }
       return reply.code(502).send({ error: "download failed" });
     }
   },

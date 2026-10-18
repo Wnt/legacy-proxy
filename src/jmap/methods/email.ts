@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ImapFlow } from "imapflow";
+import type { FetchQueryObject, ImapFlow } from "imapflow";
 import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
 import { BULK_CONNECTIONS, viewEmailState, type ImapPool } from "../../imap/pool.js";
 import { decodeEmailId, decodeMailboxId, encodeBlobId, encodeEmailId, encodeMailboxId } from "../../mapping/ids.js";
@@ -12,11 +12,14 @@ import {
   MAX_BODYSTRUCTURE_JSON_CHARS,
   boundBodyStructure,
   BudgetExceededError,
+  chargeQuery,
   checkAborted,
   newRequestBudgets,
+  QUERY_HIT_UNITS,
   type JmapEmail,
   type RequestBudgets,
 } from "../../imap/fetcher.js";
+import { abortable, RequestAbortedError } from "../../imap/abort.js";
 import { selectedUidValidity, withMailbox } from "../../imap/client.js";
 import { fetchByUid } from "../../imap/uids.js";
 import { JmapError, accountNotFound, invalidArguments, notFound, unsupportedFilter, unsupportedSort } from "../errors.js";
@@ -56,7 +59,10 @@ interface MailCtx {
   pool?: ImapPool;
   /** The session's advertised maxObjectsInGet (config limits). */
   maxObjectsInGet?: number;
-  /** Shared by every Email/get of one HTTP request; fresh per call if absent. */
+  /**
+   * Shared by every Email/get, Email/query and Email/queryChanges of one HTTP
+   * request (with its abort signal); fresh per call if absent.
+   */
   budgets?: RequestBudgets;
 }
 
@@ -164,15 +170,28 @@ function stableHash(value: unknown): string {
   });
 }
 
-function pruneSearchCache(): void {
-  if (searchCache.size <= SEARCH_CACHE_MAX) return;
+// The entries together hold at most this many UIDs (16 MB): one entry can be
+// a whole folder, so the entry count alone does not bound them.
+const SEARCH_CACHE_MAX_UIDS = 2_000_000;
+let searchCacheUids = 0;
+
+function rememberSearch(key: string, entry: SearchCacheEntry): void {
+  forgetSearch(key);
+  if (entry.uids.length > SEARCH_CACHE_MAX_UIDS) return;
+  searchCache.set(key, entry);
+  searchCacheUids += entry.uids.length;
   // Map preserves insertion order; drop the oldest entries first.
-  const drop = searchCache.size - SEARCH_CACHE_MAX;
-  let i = 0;
   for (const k of searchCache.keys()) {
-    if (i++ >= drop) break;
-    searchCache.delete(k);
+    if (searchCache.size <= SEARCH_CACHE_MAX && searchCacheUids <= SEARCH_CACHE_MAX_UIDS) break;
+    forgetSearch(k);
   }
+}
+
+function forgetSearch(key: string): void {
+  const e = searchCache.get(key);
+  if (!e) return;
+  searchCacheUids -= e.uids.length;
+  searchCache.delete(key);
 }
 
 // Drop the account's cached search results. Called after we mutate emails
@@ -188,12 +207,12 @@ function pruneSearchCache(): void {
 function invalidateSearchCacheForAccount(accountId: number, store?: Store, mailboxes?: Iterable<number>): void {
   const prefix = `${accountId}|`;
   for (const k of [...searchCache.keys()]) {
-    if (k.startsWith(prefix)) searchCache.delete(k);
+    if (k.startsWith(prefix)) forgetSearch(k);
   }
   const only = mailboxes ? [...mailboxes] : null;
   const folderPrefixes = only && only.length > 0 ? only.map((idx) => `${accountId}|${idx}|`) : [prefix];
   for (const k of [...folderSearchCache.keys()]) {
-    if (folderPrefixes.some((p) => k.startsWith(p))) folderSearchCache.delete(k);
+    if (folderPrefixes.some((p) => k.startsWith(p))) forgetFolderSearch(k);
   }
   folderSnapshots.delete(accountId);
   try {
@@ -270,18 +289,34 @@ function findInMailboxOtherThan(filter: Filter): string[] | null {
   return filter.inMailboxOtherThan ?? null;
 }
 
-export async function emailQuery(
-  args: EmailQueryArgs,
-  ctx: MailCtx,
-): Promise<{
+// A query's context: the request's budgets (and abort signal) are always set.
+type QueryCtx = MailCtx & { budgets: RequestBudgets };
+
+interface EmailQueryResponse {
   accountId: string;
   queryState: string;
   canCalculateChanges: boolean;
   position: number;
   total?: number;
   ids: string[];
-}> {
+}
+
+export async function emailQuery(args: EmailQueryArgs, ctx: MailCtx): Promise<EmailQueryResponse> {
   if (args.accountId !== String(ctx.account.id)) throw accountNotFound();
+  // Every folder worker of every query in the request draws on one allowance
+  // and stops with the request (RequestBudgets).
+  const qctx: QueryCtx = { ...ctx, budgets: ctx.budgets ?? newRequestBudgets() };
+  try {
+    return await queryEmails(args, qctx);
+  } catch (e) {
+    // Over the request's allowance (or abandoned): a method error, never a
+    // shorter list that would read as the whole result.
+    if (e instanceof BudgetExceededError) throw new JmapError("requestTooLarge", e.message);
+    throw e;
+  }
+}
+
+async function queryEmails(args: EmailQueryArgs, ctx: QueryCtx): Promise<EmailQueryResponse> {
   const filter = args.filter ?? ({} as Filter);
 
   let imapFilter;
@@ -306,7 +341,7 @@ export async function emailQuery(
   const inMailbox = findInMailbox(filter);
   const run = (window?: DateWindow) =>
     inMailbox
-      ? emailQuerySingleMailboxFull(ctx, filter, imapFilter, inMailbox, sort, ascending, needsFetch, window)
+      ? emailQuerySingleMailboxFull(ctx, filter, imapFilter, inMailbox, sort, ascending, window)
       : emailQueryAccountWideFull(ctx, filter, imapFilter, sort, ascending, needsFetch, window);
 
   let full: { ids: string[]; queryState: string };
@@ -320,6 +355,7 @@ export async function emailQuery(
     let queryState: string | null = null;
     complete = false;
     for (let i = 0; i < windows.length; i++) {
+      checkAborted(ctx.budgets.signal);
       const part = await run(windows[i]);
       // The first window's state: no later window's view is older.
       queryState ??= part.queryState;
@@ -492,7 +528,7 @@ const SLICE_MIN_MESSAGES = 2500;
 const SLICE_MAX = BULK_CONNECTIONS;
 
 async function searchUidsInSlices(
-  ctx: MailCtx,
+  ctx: QueryCtx,
   path: string,
   uidvalidity: number,
   query: ImapSearch,
@@ -506,23 +542,26 @@ async function searchUidsInSlices(
   const n = Math.min(SLICE_MAX, Math.ceil(messages / SLICE_MIN_MESSAGES));
   if (n < 2) return null;
   const ranges = uidRanges(uidNext, n);
-  const run = async (): Promise<number[]> => {
+  // The slices lease connections of their own, so they stop with the shared
+  // search (`signal`), not with any one request waiting for it.
+  const run = async (signal: AbortSignal): Promise<number[]> => {
     const parts = await mapWithConcurrency(ranges, n, (range) =>
       pool.withConnection(ctx.account, "bulk", (client) =>
         withMailbox(client, path, async () => {
           if (!isCurrentEpoch(client, uidvalidity)) throw new Error("UIDVALIDITY changed during the search");
-          const r = await client.search({ ...query, uid: range }, { uid: true });
-          return Array.isArray(r) ? (r as number[]) : [];
-        }),
-      ),
+          return abortable(client, signal, () => searchUids(client, { ...query, uid: range }));
+        }, signal),
+      signal),
     );
     const all = new Set<number>();
     for (const p of parts) for (const uid of p) all.add(uid);
     return [...all].sort((a, b) => a - b);
   };
   try {
-    return await sharedSearch(`${searchKey(ctx.account.id, path, uidvalidity, query)}|slices:${n}`, run);
+    return await sharedSearch(`${searchKey(ctx.account.id, path, uidvalidity, query)}|slices:${n}`, run, ctx.budgets.signal);
   } catch (e) {
+    // The request was abandoned: no search in one go either.
+    if (e instanceof BudgetExceededError) throw e;
     // No bulk connection to be had (or the folder changed under us): the
     // caller searches the folder in one go instead.
     log.warn({ mailbox: path, err: (e as Error).message }, "sliced search failed; searching in one go");
@@ -531,27 +570,124 @@ async function searchUidsInSlices(
 }
 
 // One full-text SEARCH per account, folder, UIDVALIDITY and query at a time.
-// A search keeps running when its client gives up (a proxy's request limit),
-// and filing its result is what lets the client's next try finish quickly; a
-// try that arrives while it still runs waits for it instead of reading every
-// message a second time, competing with it for the same connections.
-const inflightSearches = new Map<string, Promise<number[]>>();
+// A try that arrives while the same search still runs waits for it instead of
+// reading every message a second time, competing with it for the same
+// connections.
+//
+// Each request waiting for a search is counted. One that is abandoned stops
+// waiting at once, and the search runs on for the others. When nobody waits
+// any more it still runs for a short grace: a client whose proxy gave up on a
+// long search asks again at once, and finds it still running (or its result
+// filed). Past the grace it is stopped: its queued slices never start and the
+// SEARCHes still running are cut off (abortable).
+interface SharedSearch {
+  promise: Promise<number[]>;
+  stop: AbortController;
+  waiters: number;
+  settled: boolean;
+  idle?: ReturnType<typeof setTimeout>;
+}
+const inflightSearches = new Map<string, SharedSearch>();
+let sharedSearchGraceMs = 10_000;
+
+/** The grace an unwatched search keeps running for (tests). */
+export function setSharedSearchGraceMs(ms: number): void {
+  sharedSearchGraceMs = ms;
+}
 
 function searchKey(accountId: number, path: string, uidvalidity: number, query: ImapSearch): string {
   return `${accountId}|${path}|${uidvalidity}|${stableHash(query)}`;
 }
 
-function sharedSearch(key: string, run: () => Promise<number[]>): Promise<number[]> {
-  const running = inflightSearches.get(key);
-  if (running) return running;
-  const p = run().finally(() => inflightSearches.delete(key));
-  inflightSearches.set(key, p);
-  return p;
+/**
+ * Wait for the search `key`, starting it with `run` if none is running.
+ * `onCallerConnection`: `run` uses the caller's own connection (which is busy
+ * with it until it settles). A caller that started such a search waits for it
+ * to settle even when its own request is abandoned, then throws; it never
+ * hands back a connection with the search still on it.
+ */
+function sharedSearch(
+  key: string,
+  run: (signal: AbortSignal) => Promise<number[]>,
+  signal: AbortSignal | undefined,
+  onCallerConnection = false,
+): Promise<number[]> {
+  checkAborted(signal);
+  let s = inflightSearches.get(key);
+  const started = !s;
+  if (!s) {
+    const entry: SharedSearch = { promise: null as never, stop: new AbortController(), waiters: 0, settled: false };
+    entry.promise = run(entry.stop.signal).finally(() => {
+      entry.settled = true;
+      clearTimeout(entry.idle);
+      if (inflightSearches.get(key) === entry) inflightSearches.delete(key);
+    });
+    // Every waiter handles the outcome; one that left must not leave it unhandled.
+    entry.promise.catch(() => {});
+    inflightSearches.set(key, entry);
+    s = entry;
+  }
+  const entry = s;
+  entry.waiters++;
+  clearTimeout(entry.idle);
+  entry.idle = undefined;
+  let left = false;
+  const leave = () => {
+    if (left) return;
+    left = true;
+    if (--entry.waiters > 0 || entry.settled) return;
+    entry.idle = setTimeout(() => {
+      if (entry.waiters > 0 || entry.settled) return;
+      // A later identical search starts afresh rather than joining this one.
+      if (inflightSearches.get(key) === entry) inflightSearches.delete(key);
+      entry.stop.abort();
+    }, sharedSearchGraceMs);
+    entry.idle.unref?.();
+  };
+  if (!signal) return entry.promise.finally(leave);
+  if (started && onCallerConnection) {
+    signal.addEventListener("abort", leave, { once: true });
+    return entry.promise
+      .finally(() => {
+        signal.removeEventListener("abort", leave);
+        leave();
+      })
+      .then((uids) => {
+        checkAborted(signal);
+        return uids;
+      });
+  }
+  return new Promise<number[]>((resolve, reject) => {
+    const onAbort = () => {
+      leave();
+      reject(new RequestAbortedError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    entry.promise.then(
+      (uids) => {
+        signal.removeEventListener("abort", onAbort);
+        leave();
+        resolve(uids);
+      },
+      (e: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        leave();
+        reject(e);
+      },
+    );
+  });
 }
 
 /** In-flight full-text SEARCHes (tests). */
 export function inflightSearchCount(): number {
   return inflightSearches.size;
+}
+
+/** Requests waiting for in-flight full-text SEARCHes, over all of them (tests). */
+export function sharedSearchWaiters(): number {
+  let n = 0;
+  for (const s of inflightSearches.values()) n += s.waiters;
+  return n;
 }
 
 /** `n` UID ranges that together cover 1:* (the last one is open-ended). */
@@ -566,6 +702,17 @@ export function uidRanges(uidNext: number, n: number): string[] {
     if (lo + step > top) break;
   }
   return out;
+}
+
+/**
+ * UID SEARCH. imapflow answers a failed SEARCH (a NO, a dropped connection)
+ * with `false`; that is an error here, never "no matches", which would be
+ * shown and cached as an empty result.
+ */
+async function searchUids(client: ImapFlow, query: ImapSearch): Promise<number[]> {
+  const r = await client.search(query, { uid: true });
+  if (!Array.isArray(r)) throw new Error("IMAP SEARCH failed");
+  return r as number[];
 }
 
 // What a window's SEARCH result is cached under. Without a window it is the
@@ -624,36 +771,67 @@ function compareHits(a: SortableHit, b: SortableHit, sort: SortSpec[]): number {
   return 0;
 }
 
-// Enrich UIDs with whatever metadata the requested sort needs. Non-receivedAt
-// sorts FETCH envelope/size/flags from IMAP — batched per mailbox, split into
-// bounded UID sets so huge folders don't overflow the server's line limit.
+// What a sort reads from the server besides the date: RFC822.SIZE for `size`,
+// the ENVELOPE for `from`/`to`/`subject`/`sentAt`, FLAGS for `hasKeyword`.
+interface SortFields {
+  size: boolean;
+  envelope: boolean;
+  flags: boolean;
+}
+
+function sortFields(sort: SortSpec[]): SortFields {
+  const has = (...props: string[]) => sort.some((s) => props.includes(s.property));
+  return { size: has("size"), envelope: has("from", "to", "subject", "sentAt"), flags: has("hasKeyword") };
+}
+
+type SortMeta = Omit<SortableHit, "mailboxIdx" | "uidvalidity" | "uid">;
+
+// Enrich UIDs with the metadata the requested sort needs (`fields`; null for
+// the date alone) - batched per mailbox, split into bounded UID sets so huge
+// folders don't overflow the server's line limit. What each message keeps is
+// charged to the request's query allowance as it arrives (the hit itself was
+// charged with the SEARCH result), and the FETCH stops with the request.
 async function fetchSortMetadata(
   client: ImapFlow,
   uids: number[],
-  needsFetch: boolean,
-): Promise<Map<number, { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }>> {
-  const out = new Map<number, { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }>();
+  fields: SortFields | null,
+  budgets: RequestBudgets,
+): Promise<Map<number, SortMeta>> {
+  const out = new Map<number, SortMeta>();
   if (uids.length === 0) return out;
-  const query = needsFetch
-    ? { uid: true, internalDate: true, size: true, envelope: true, flags: true }
-    : { uid: true, internalDate: true };
-  for await (const msg of fetchByUid(client, uids, query)) {
-    const uid = Number(msg.uid);
-    // Only sort keys are kept, as each message arrives: lower-cased once and
-    // cut to SORT_KEY_CHARS, so a sender's huge Subject or address costs
-    // neither memory per hit nor work per comparison.
-    out.set(uid, {
-      receivedAt: msg.internalDate ? new Date(msg.internalDate).getTime() : 0,
-      size: typeof msg.size === "number" ? msg.size : undefined,
-      from: sortKey(pickFirstAddr((msg.envelope as { from?: { address?: string }[] } | undefined)?.from)),
-      to: sortKey(pickFirstAddr((msg.envelope as { to?: { address?: string }[] } | undefined)?.to)),
-      subject: sortKey((msg.envelope as { subject?: string } | undefined)?.subject),
-      sentAt: (msg.envelope as { date?: Date | string } | undefined)?.date
-        ? new Date((msg.envelope as { date: Date | string }).date).getTime()
-        : 0,
-      flags: msg.flags ? new Set(msg.flags) : undefined,
-    });
-  }
+  const query: FetchQueryObject = {
+    uid: true,
+    internalDate: true,
+    ...(fields?.size ? { size: true } : {}),
+    ...(fields?.envelope ? { envelope: true } : {}),
+    ...(fields?.flags ? { flags: true } : {}),
+  };
+  await abortable(client, budgets.signal, async () => {
+    for await (const msg of fetchByUid(client, uids, query)) {
+      checkAborted(budgets.signal);
+      // A FLAGS-only FETCH the server pushes mid-command (another session
+      // changed flags) is not this command's answer.
+      if (msg.uid == null || !msg.internalDate) continue;
+      const uid = Number(msg.uid);
+      const env = msg.envelope as { from?: { address?: string }[]; to?: { address?: string }[]; subject?: string; date?: Date | string } | undefined;
+      // Only sort keys are kept: lower-cased once and cut to SORT_KEY_CHARS, so
+      // a sender's huge Subject or address costs neither memory per hit nor
+      // work per comparison.
+      const meta: SortMeta = { receivedAt: new Date(msg.internalDate).getTime() };
+      if (fields?.size) meta.size = typeof msg.size === "number" ? msg.size : undefined;
+      if (fields?.envelope) {
+        meta.from = sortKey(pickFirstAddr(env?.from));
+        meta.to = sortKey(pickFirstAddr(env?.to));
+        meta.subject = sortKey(env?.subject);
+        meta.sentAt = env?.date ? new Date(env.date).getTime() : 0;
+      }
+      if (fields?.flags && msg.flags) meta.flags = new Set(msg.flags);
+      let units = (meta.from?.length ?? 0) + (meta.to?.length ?? 0) + (meta.subject?.length ?? 0);
+      for (const f of meta.flags ?? []) units += f.length + 16;
+      if (units > 0) chargeQuery(budgets, units);
+      out.set(uid, meta);
+    }
+  });
   return out;
 }
 
@@ -673,10 +851,11 @@ function pickFirstAddr(addrs: { address?: string }[] | undefined): string | unde
 // fine for v1 — clients that page narrowly stay snappy; the slow path is
 // only triggered when the filter explicitly asks for hasAttachment.
 async function postFilterByHasAttachment(
-  ctx: MailCtx,
+  ctx: QueryCtx,
   ids: string[],
   want: boolean,
 ): Promise<string[]> {
+  const signal = ctx.budgets.signal;
   if (ids.length === 0) return ids;
   // One group per mailbox and UIDVALIDITY epoch, so cache rows are read and
   // written under the epoch the ids name.
@@ -735,28 +914,33 @@ async function postFilterByHasAttachment(
         // Bounded like Email/get's, judged as each arrives, and written in
         // batches: the filter keeps only the predicate per message.
         let upserts: EmailCacheUpsert[] = [];
-        for await (const msg of fetchByUid(ctx.client, missingUids, { uid: true, bodyStructure: true })) {
-          const uid = Number(msg.uid);
-          const eid = uidByEid.get(uid);
-          // A FLAGS-only FETCH pushed mid-command has no structure to judge by.
-          if (!eid || !msg.bodyStructure) continue;
-          const bs = boundBodyStructure(msg.bodyStructure);
-          if (bodyStructureHasAttachment(bs) === want) keep.add(eid);
-          upserts.push({
-            accountId: ctx.account.id,
-            mailboxId: mailboxIdx,
-            uidvalidity,
-            uid,
-            bodystructure: JSON.stringify(bs),
-          });
-          if (upserts.length >= 256) {
-            ctx.store.upsertEmailCacheRows(upserts);
-            upserts = [];
+        await abortable(ctx.client, signal, async () => {
+          for await (const msg of fetchByUid(ctx.client, missingUids, { uid: true, bodyStructure: true })) {
+            checkAborted(signal);
+            const uid = Number(msg.uid);
+            const eid = uidByEid.get(uid);
+            // A FLAGS-only FETCH pushed mid-command has no structure to judge by.
+            if (!eid || !msg.bodyStructure) continue;
+            const bs = boundBodyStructure(msg.bodyStructure);
+            if (bodyStructureHasAttachment(bs) === want) keep.add(eid);
+            upserts.push({
+              accountId: ctx.account.id,
+              mailboxId: mailboxIdx,
+              uidvalidity,
+              uid,
+              bodystructure: JSON.stringify(bs),
+            });
+            if (upserts.length >= 256) {
+              ctx.store.upsertEmailCacheRows(upserts);
+              upserts = [];
+            }
           }
-        }
+        });
         ctx.store.upsertEmailCacheRows(upserts);
-      });
-    } catch {
+      }, signal);
+    } catch (e) {
+      // An abandoned request stops here.
+      if (e instanceof BudgetExceededError) throw e;
       // Skip folders we can't open; their candidates fall out of the filter.
     }
   }
@@ -789,13 +973,12 @@ function bodyStructureHasAttachment(bs: unknown): boolean {
 }
 
 async function emailQuerySingleMailboxFull(
-  ctx: MailCtx,
+  ctx: QueryCtx,
   filter: Filter,
   imapFilter: ReturnType<typeof compileFilter>,
   inMailbox: string,
   sort: SortSpec[],
   ascending: boolean,
-  needsFetch: boolean,
   window?: DateWindow,
 ): Promise<{ ids: string[]; queryState: string }> {
   const m = decodeMailboxId(inMailbox);
@@ -803,6 +986,7 @@ async function emailQuerySingleMailboxFull(
     .prep(`SELECT * FROM mailbox WHERE id = ? AND account_id = ?`)
     .get(m.mailboxIdx, ctx.account.id) as { name: string; uidvalidity: number } | undefined;
   if (!mboxRow) throw invalidArguments("unknown mailbox");
+  const signal = ctx.budgets.signal;
 
   return await withMailbox(ctx.client, mboxRow.name, async () => {
     const status = ctx.client.mailbox && typeof ctx.client.mailbox === "object" ? ctx.client.mailbox : null;
@@ -826,22 +1010,22 @@ async function emailQuerySingleMailboxFull(
       if (sliced) {
         uids = sliced;
       } else {
-        const search = async () => {
-          const r = await ctx.client.search(query, { uid: true });
-          return Array.isArray(r) ? (r as number[]) : [];
-        };
+        // On this request's connection: a shared search stops when nobody
+        // waits for it any more (sharedSearch), any other with the request.
+        const search = (stop: AbortSignal | undefined) => abortable(ctx.client, stop, () => searchUids(ctx.client, query));
         uids = hasFullTextTerm(filter)
-          ? await sharedSearch(searchKey(ctx.account.id, mboxRow.name, uidvalidity, query), search)
-          : await search();
+          ? await sharedSearch(searchKey(ctx.account.id, mboxRow.name, uidvalidity, query), search, signal, true)
+          : await search(signal);
       }
-      searchCache.set(cacheKey, {
+      rememberSearch(cacheKey, {
         uids,
         modseq,
         emailState,
         expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
       });
-      pruneSearchCache();
     }
+    // Every hit the result holds before its page is cut.
+    chargeQuery(ctx.budgets, uids.length * QUERY_HIT_UNITS);
     let orderedUids: number[];
     // Fast path: a pure receivedAt sort (or no sort) is UID order in a single
     // mailbox — SEARCH already returned UIDs ascending, so no FETCH at all.
@@ -855,7 +1039,7 @@ async function emailQuerySingleMailboxFull(
       const uidAscending = sort.length > 0 ? sort[0]!.isAscending !== false : ascending;
       orderedUids = uidAscending ? uids : uids.slice().reverse();
     } else {
-      const meta = await fetchSortMetadata(ctx.client, uids, needsFetch);
+      const meta = await fetchSortMetadata(ctx.client, uids, sortFields(sort), ctx.budgets);
       const hits: SortableHit[] = uids.map((uid) => ({
         mailboxIdx: m.mailboxIdx,
         uidvalidity,
@@ -879,7 +1063,7 @@ async function emailQuerySingleMailboxFull(
       // (see viewState), not whatever the counter reads by now.
       queryState: encodeEmailState({ uidvalidity: 0, modseq: emailState }),
     };
-  });
+  }, signal);
 }
 
 // Account-wide Email/query. Spec-compliant fallback for clients that don't pin
@@ -926,6 +1110,9 @@ interface FolderSearchEntry extends FolderStatus {
 }
 const folderSearchCache = new Map<string, FolderSearchEntry>();
 const FOLDER_SEARCH_CACHE_MAX = 4096;
+// Like SEARCH_CACHE_MAX_UIDS, for these entries together.
+const FOLDER_SEARCH_CACHE_MAX_UIDS = 2_000_000;
+let folderSearchCacheUids = 0;
 
 async function folderSnapshot(ctx: MailCtx, emailState: number): Promise<FolderSnapshot | null> {
   const id = ctx.account.id;
@@ -971,7 +1158,9 @@ async function folderSnapshot(ctx: MailCtx, emailState: number): Promise<FolderS
 /** Forget the in-memory search caches, as a restart does (tests). */
 export function resetSearchCachesInMemory(): void {
   searchCache.clear();
+  searchCacheUids = 0;
   folderSearchCache.clear();
+  folderSearchCacheUids = 0;
   folderSnapshots.clear();
 }
 
@@ -1018,19 +1207,25 @@ function putFolderSearch(store: Store, accountId: number, idx: number, filterHas
 }
 
 function rememberFolderSearch(key: string, entry: FolderSearchEntry): void {
-  folderSearchCache.delete(key);
+  forgetFolderSearch(key);
+  if (entry.uids.length > FOLDER_SEARCH_CACHE_MAX_UIDS) return;
   folderSearchCache.set(key, entry);
-  if (folderSearchCache.size <= FOLDER_SEARCH_CACHE_MAX) return;
-  const drop = folderSearchCache.size - FOLDER_SEARCH_CACHE_MAX;
-  let i = 0;
+  folderSearchCacheUids += entry.uids.length;
   for (const k of folderSearchCache.keys()) {
-    if (i++ >= drop) break;
-    folderSearchCache.delete(k);
+    if (folderSearchCache.size <= FOLDER_SEARCH_CACHE_MAX && folderSearchCacheUids <= FOLDER_SEARCH_CACHE_MAX_UIDS) break;
+    forgetFolderSearch(k);
   }
 }
 
+function forgetFolderSearch(key: string): void {
+  const e = folderSearchCache.get(key);
+  if (!e) return;
+  folderSearchCacheUids -= e.uids.length;
+  folderSearchCache.delete(key);
+}
+
 async function emailQueryAccountWideFull(
-  ctx: MailCtx,
+  ctx: QueryCtx,
   filter: Filter,
   imapFilter: ReturnType<typeof compileFilter>,
   sort: SortSpec[],
@@ -1050,6 +1245,8 @@ async function emailQueryAccountWideFull(
     }
   }
 
+  const signal = ctx.budgets.signal;
+  const fields = sortFields(sort);
   // Folders are scanned on bulk connections leased after this one, so their
   // views include at least the state this connection is at.
   const emailState = viewState(ctx, ctx.client);
@@ -1075,6 +1272,7 @@ async function emailQueryAccountWideFull(
   // change. Without it (LIST failed, or a server without CONDSTORE) every
   // folder is searched, as before.
   const snapshot = await folderSnapshot(ctx, emailState);
+  checkAborted(signal);
   const filterHash = createHash("sha256").update(stableHash(windowedCacheKey(filter, window))).digest("hex");
 
   const targets: Array<{ idx: number; row: MboxRow }> = [];
@@ -1101,6 +1299,7 @@ async function emailQueryAccountWideFull(
     const hit = getFolderSearch(ctx.store, ctx.account.id, idx, live.uidValidity, filterHash);
     if (!hit || !sameFolderStatus(hit, live)) return null;
     if (hit.uids.length === 0) return [];
+    chargeQuery(ctx.budgets, hit.uids.length * QUERY_HIT_UNITS);
     const rows = ctx.store.getEmailCacheRows(ctx.account.id, idx, live.uidValidity, hit.uids);
     const found: SortableHit[] = [];
     for (const uid of hit.uids) {
@@ -1137,30 +1336,27 @@ async function emailQueryAccountWideFull(
       }
       if (!uids) {
         const query = windowedSearch(imapFilter, window);
-        const search = async () => {
-          const r = await client.search(query, { uid: true });
-          return Array.isArray(r) ? (r as number[]) : [];
-        };
-        uids = fullText ? await sharedSearch(searchKey(ctx.account.id, row.name, uidvalidity, query), search) : await search();
-        searchCache.set(cacheKey, {
+        // On this worker's connection: see the single-mailbox search.
+        const search = (stop: AbortSignal | undefined) => abortable(client, stop, () => searchUids(client, query));
+        uids = fullText
+          ? await sharedSearch(searchKey(ctx.account.id, row.name, uidvalidity, query), search, signal, true)
+          : await search(signal);
+        rememberSearch(cacheKey, {
           uids,
           modseq,
           emailState,
           expiresAt: Date.now() + SEARCH_CACHE_TTL_MS,
         });
-        pruneSearchCache();
         if (live && live.uidValidity === uidvalidity) putFolderSearch(ctx.store, ctx.account.id, idx, filterHash, { ...live, uids });
       }
       if (uids.length === 0) return;
+      chargeQuery(ctx.budgets, uids.length * QUERY_HIT_UNITS);
 
       // Cross-folder merge needs receivedAt for every hit. Prefer the
       // cached internaldate (populated by the thread scan and Email/get) —
       // for warm accounts this drops the FETCH entirely. Sorts on other
       // properties still need the live envelope/size/flags FETCH.
-      const meta = new Map<
-        number,
-        { size?: number; from?: string; to?: string; subject?: string; sentAt?: number; receivedAt?: number; flags?: Set<string> }
-      >();
+      const meta = new Map<number, SortMeta>();
       let toFetch = uids;
       if (!needsFetch) {
         const cachedRows = ctx.store.getEmailCacheRows(ctx.account.id, idx, uidvalidity, uids);
@@ -1172,7 +1368,7 @@ async function emailQueryAccountWideFull(
         }
       }
       if (toFetch.length > 0) {
-        const fetched = await fetchSortMetadata(client, toFetch, needsFetch);
+        const fetched = await fetchSortMetadata(client, toFetch, needsFetch ? fields : null, ctx.budgets);
         for (const [uid, m2] of fetched) meta.set(uid, m2);
         if (!needsFetch) {
           // Remember the dates so the next account-wide query is FETCH-free.
@@ -1195,7 +1391,7 @@ async function emailQueryAccountWideFull(
         const m2 = meta.get(uid);
         found.push({ mailboxIdx: idx, uidvalidity, uid, ...m2 });
       }
-    });
+    }, signal);
     return found;
   };
 
@@ -1219,6 +1415,7 @@ async function emailQueryAccountWideFull(
       putFolderSearch(ctx.store, ctx.account.id, idx, filterHash, { ...live, uids });
     }
     if (uids.length === 0) return [];
+    chargeQuery(ctx.budgets, uids.length * QUERY_HIT_UNITS);
     const dates = new Map<number, number>();
     const cachedRows = ctx.store.getEmailCacheRows(ctx.account.id, idx, uidvalidity, uids);
     const toFetch: number[] = [];
@@ -1231,7 +1428,7 @@ async function emailQueryAccountWideFull(
       await pool.withConnection(ctx.account, "bulk", (client) =>
         withMailbox(client, row.name, async () => {
           if (!isCurrentEpoch(client, uidvalidity)) throw new Error("UIDVALIDITY changed during the search");
-          const fetched = await fetchSortMetadata(client, toFetch, false);
+          const fetched = await fetchSortMetadata(client, toFetch, null, ctx.budgets);
           const upserts: EmailCacheUpsert[] = [];
           for (const [uid, m2] of fetched) {
             if (!m2.receivedAt) continue;
@@ -1239,13 +1436,17 @@ async function emailQueryAccountWideFull(
             upserts.push({ accountId: ctx.account.id, mailboxId: idx, uidvalidity, uid, internaldate: m2.receivedAt });
           }
           ctx.store.upsertEmailCacheRows(upserts);
-        }),
-      );
+        }, signal),
+      signal);
     }
     return uids.map((uid) => ({ mailboxIdx: idx, uidvalidity, uid, receivedAt: dates.get(uid) }));
   };
 
+  // A request that is abandoned, or runs out of its allowance, stops its
+  // workers: no folder starts after that (mapWithConcurrency), and the ones
+  // running stop at their next check or command.
   const perFolder = await mapWithConcurrency(targets, ACCOUNT_SCAN_CONCURRENCY, async (t) => {
+    checkAborted(signal);
     const cachedHits = cachedFolderHits(t.idx, t.row);
     if (cachedHits) return cachedHits;
     try {
@@ -1258,8 +1459,11 @@ async function emailQueryAccountWideFull(
       }
       return await ctx.pool.withConnection(ctx.account, "bulk", (client) =>
         scanFolder(t.idx, t.row, client),
-      );
+      signal);
     } catch (e) {
+      // Out of budget or abandoned: the query fails, it does not answer
+      // without the folder.
+      if (e instanceof BudgetExceededError) throw e;
       // A folder can disappear between LIST and SELECT (concurrent mutation),
       // and the DB may carry rows for folders the server no longer reports.
       // Skip rather than fail the whole query - pinned-mailbox queries still
@@ -1412,9 +1616,11 @@ export async function emailGet(
         subscribed: 0,
         last_seen: 0,
       } as never;
-      checkAborted(budgets.signal);
-      return fetchEmailsBatch(ctx.client, ctx.account, mailboxArg, uids, bodyOpts, ctx.store);
-    }).catch((e) => {
+      // A FETCH the server stops answering is cut off when the request is
+      // abandoned, rather than holding the connection until it times out.
+      return abortable(ctx.client, budgets.signal, () =>
+        fetchEmailsBatch(ctx.client, ctx.account, mailboxArg, uids, bodyOpts, ctx.store));
+    }, budgets.signal).catch((e) => {
       if (e instanceof BudgetExceededError) throw new JmapError("requestTooLarge", e.message);
       throw e;
     });
