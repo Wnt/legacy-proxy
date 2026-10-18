@@ -136,7 +136,7 @@ describe("newest-first text search without a total reads only the newest date wi
     expect(searches(imap).every((l) => /\bSINCE\b/.test(l.line) && !/\bBEFORE\b/.test(l.line))).toBe(true);
   }, 60_000);
 
-  it("a rare term: every window, all matches, and the total", async () => {
+  it("a rare term: the newest window, then all older mail at once; all matches and the total", async () => {
     const imap = folders();
     for (let i = 0; i < 50; i++) imap.add("INBOX", { subject: `Plain ${i}`, date: daysAgo(i * 20) });
     imap.add("INBOX", { subject: "Rareword recent", date: daysAgo(1) });
@@ -151,8 +151,10 @@ describe("newest-first text search without a total reads only the newest date wi
     });
     expect(r.ids).toHaveLength(2);
     expect(r.total).toBe(2);
-    // One SEARCH per non-empty folder per window, and no more.
-    expect(searches(imap)).toHaveLength(2 * textSearchWindows(new Date()).length);
+    // Next to nothing in the newest window: everything older is read in one
+    // go, so each non-empty folder is searched twice, not once per window.
+    expect(searches(imap)).toHaveLength(2 * 2);
+    expect(searches(imap).filter((l) => /\bBEFORE\b/.test(l.line) && !/\bSINCE\b/.test(l.line))).toHaveLength(2);
   }, 60_000);
 });
 

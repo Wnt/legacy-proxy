@@ -330,6 +330,10 @@ export async function emailQuery(
       }
       const have = args.collapseThreads === true ? (await collapseByThread(ctx, ids)).length : ids.length;
       if (have >= needed) break;
+      // Few matches so far: a rare term, which will need most of the history
+      // anyway. Each window costs every folder a SELECT and a SEARCH, so read
+      // everything older in one last window instead of window by window.
+      if (have * 4 < needed) windows.splice(i + 1, windows.length, { before: windows[i]!.since! });
     }
     full = { ids, queryState: queryState! };
   } else {
@@ -431,7 +435,7 @@ export interface DateWindow {
 
 // Window bounds, in months before the start of the current month (UTC).
 // Fixed calendar bounds keep each window's per-folder SEARCH results reusable
-// all month; widening steps keep a rare term to a handful of extra round trips.
+// all month. A term with few matches skips the middle windows (see the loop).
 const TEXT_SEARCH_WINDOW_MONTHS = [1, 4, 13, 37];
 
 export function textSearchWindows(now: Date): DateWindow[] {
