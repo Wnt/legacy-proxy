@@ -52,6 +52,9 @@ interface Worker {
   inbox: { uidValidity: number; uids: number[] } | null;
   // Diffs run one at a time, in event order, on this chain.
   queue: Promise<void>;
+  // Diffs queued or running. While any is outstanding, `inbox` may not match
+  // the IDLE session's sequence numbers (an expunge renumbers them).
+  pendingSyncs: number;
 }
 
 export class PushIdleManager {
@@ -108,6 +111,7 @@ export class PushIdleManager {
       backoffMs: RECONNECT_MIN_MS,
       inbox: null,
       queue: Promise.resolve(),
+      pendingSyncs: 0,
     };
     this.workers.set(accountId, worker);
     this.connect(account, worker).catch((err) => {
@@ -163,14 +167,25 @@ export class PushIdleManager {
       this.enqueue(account, worker, client, "full");
     });
 
-    client.on("flags", (ev: { uid?: number }) => {
-      // Read/Flagged toggles from another device land here. No EmailDelivery
-      // bump (no new mail), but Email state moved. Servers usually include
-      // the UID (Stalwart does); without it the change is a gap.
+    client.on("flags", (ev: { seq?: number; uid?: number }) => {
+      // Read/Flagged toggles land here - from another device, and from our
+      // own Email/set (marking an opened message read). No EmailDelivery bump
+      // (no new mail), but Email state moved. Stalwart includes the UID.
+      // Gandi's server sends only the sequence number; that is this session's
+      // position in INBOX, which `inbox.uids` lists in order, so it names the
+      // message as long as nothing renumbered it: no diff outstanding (an
+      // expunge queues one) and this session counts as many messages as the
+      // list. Otherwise the change is a gap, as before. A gap made every read
+      // flag cost the webmail a full re-list of the open folder.
       const inbox = worker.inbox;
-      if (inbox && ev.uid !== undefined) {
+      let uid = ev.uid;
+      if (uid === undefined && inbox && ev.seq !== undefined && worker.pendingSyncs === 0
+        && client.mailbox && Number(client.mailbox.exists) === inbox.uids.length) {
+        uid = inbox.uids[ev.seq - 1];
+      }
+      if (inbox && uid !== undefined) {
         this.store.recordChanges(account.id, "email", {
-          updated: [this.emailId(account.id, inbox.uidValidity, ev.uid)],
+          updated: [this.emailId(account.id, inbox.uidValidity, uid)],
         });
       } else {
         this.store.bumpState(account.id, "email");
@@ -223,7 +238,10 @@ export class PushIdleManager {
   // Run diffs one at a time in event order: each one reads and replaces
   // worker.inbox.
   private enqueue(account: AccountRow, worker: Worker, client: ImapFlow, kind: "arrival" | "full"): void {
-    worker.queue = worker.queue.then(() => this.syncInbox(account, worker, client, kind));
+    worker.pendingSyncs++;
+    worker.queue = worker.queue
+      .then(() => this.syncInbox(account, worker, client, kind))
+      .finally(() => { worker.pendingSyncs--; });
   }
 
   // Bring worker.inbox in step with the server and record the difference.

@@ -39,13 +39,14 @@ class FakeServer {
   }
 
   // Another client sets a flag: IDLE-ing sessions get an untagged FETCH
-  // with FLAGS and UID, as Stalwart sends it.
-  flag(uid: number, flag: string): void {
+  // with FLAGS and UID, as Stalwart sends it; with `withUid: false` only the
+  // sequence number, as Gandi's server sends it.
+  flag(uid: number, flag: string, { withUid = true } = {}): void {
     const m = this.messages.find((x) => x.uid === uid)!;
     m.flags.add(flag);
     for (const s of this.sessions) {
       const seq = s.view.findIndex((x) => x.uid === uid) + 1;
-      if (s.idling && seq > 0) s.emit("flags", { path: "INBOX", seq, uid, flags: m.flags });
+      if (s.idling && seq > 0) s.emit("flags", { path: "INBOX", seq, ...(withUid ? { uid } : {}), flags: m.flags });
     }
   }
 
@@ -334,6 +335,39 @@ describe("IDLE-announced changes are visible on the request path", () => {
     const ch = await changes(before.queryState);
     expect(ch.updated).toEqual([before.ids[0]]);
     expect(ch.created).toEqual([]);
+  });
+
+  // Open performance (2026-10-18): marking an opened message read made
+  // Email/changes answer cannotCalculateChanges, because Gandi announces the
+  // flag change with a sequence number only; the webmail then re-listed the
+  // whole folder (about a second) right after every first open.
+  it("names a flag change announced without a UID (sequence number only) as updated", async () => {
+    const before = await query();
+    server.flag(2, "\\Seen", { withUid: false });
+    await settled();
+    const ch = await changes(before.queryState);
+    expect(ch.updated).toEqual([before.ids[0]]);
+    expect(ch.created).toEqual([]);
+    expect(ch.destroyed).toEqual([]);
+  });
+
+  it("keeps a UID-less flag change a gap while an expunge has not been re-listed", async () => {
+    const before = await query();
+    const worker = [...server.sessions].find((s) => s.idling)!;
+    // The expunge renumbers the session's messages; the flag arrives before the re-list ran.
+    server.expunge(1);
+    worker.emit("flags", { path: "INBOX", seq: 1, flags: new Set(["\\Seen"]) });
+    await settled();
+    await expect(changes(before.queryState)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
+  });
+
+  it("keeps a UID-less flag change a gap for a message the list does not hold yet", async () => {
+    const before = await query();
+    const worker = [...server.sessions].find((s) => s.idling)!;
+    server.deliver("brand new");
+    worker.emit("flags", { path: "INBOX", seq: 3, flags: new Set(["\\Seen"]) });
+    await settled();
+    await expect(changes(before.queryState)).rejects.toMatchObject({ type: "cannotCalculateChanges" });
   });
 
   it("lists mail that arrived while the IDLE socket was down", async () => {
