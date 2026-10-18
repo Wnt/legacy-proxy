@@ -11,6 +11,7 @@
 // IDLE blocking every Email/get the user issues. The dedicated socket also
 // means a request-path connection drop never costs us push uptime.
 
+import { inboxFlagsChanged, inboxGap, inboxListed, inboxSyncDone, inboxSyncQueued, inboxUnwatched } from "./inbox-flags.js";
 import { ImapFlow } from "imapflow";
 import { prefetchEmails } from "../imap/prefetch.js";
 import type { Credentials } from "../auth/credentials.js";
@@ -122,6 +123,7 @@ export class PushIdleManager {
 
   private async stop(accountId: number, worker: Worker): Promise<void> {
     worker.closing = true;
+    inboxUnwatched(accountId);
     if (worker.reconnectTimer) clearTimeout(worker.reconnectTimer);
     if (worker.refreshTimer) clearTimeout(worker.refreshTimer);
     if (worker.client) {
@@ -157,6 +159,7 @@ export class PushIdleManager {
       } else {
         // The count moved without new mail; bump mailbox so cached counts refresh.
         this.store.bumpState(account.id, "mailbox");
+        inboxGap(account.id);
       }
     });
 
@@ -187,13 +190,18 @@ export class PushIdleManager {
         this.store.recordChanges(account.id, "email", {
           updated: [this.emailId(account.id, inbox.uidValidity, uid)],
         });
+        const flags = (ev as { flags?: Iterable<string> }).flags;
+        if (flags) inboxFlagsChanged(account.id, uid, flags);
+        else inboxGap(account.id);
       } else {
         this.store.bumpState(account.id, "email");
+        inboxGap(account.id);
       }
     });
 
     client.on("close", () => {
       log.info({ accountId: account.id }, "idle: connection closed");
+      inboxUnwatched(account.id);
       if (worker.refreshTimer) clearTimeout(worker.refreshTimer);
       if (worker.client === client) worker.client = null;
       this.scheduleReconnect(account, worker);
@@ -239,9 +247,10 @@ export class PushIdleManager {
   // worker.inbox.
   private enqueue(account: AccountRow, worker: Worker, client: ImapFlow, kind: "arrival" | "full"): void {
     worker.pendingSyncs++;
+    inboxSyncQueued(account.id);
     worker.queue = worker.queue
       .then(() => this.syncInbox(account, worker, client, kind))
-      .finally(() => { worker.pendingSyncs--; });
+      .finally(() => { worker.pendingSyncs--; inboxSyncDone(account.id); });
   }
 
   // Bring worker.inbox in step with the server and record the difference.
@@ -274,6 +283,8 @@ export class PushIdleManager {
         }),
       );
       worker.inbox = seen;
+      if (!inbox || inbox.uidValidity !== seen.uidValidity) inboxGap(account.id);
+      inboxListed(account.id, seen.uidValidity, seen.uids);
       if (inbox && inbox.uidValidity === seen.uidValidity) {
         this.recordDiff(account, inbox.uids, seen.uids, seen.uidValidity);
       } else {
@@ -286,6 +297,7 @@ export class PushIdleManager {
       // list so the next sync starts over.
       log.warn({ accountId: account.id, err: (err as Error).message }, "idle: inbox sync failed");
       worker.inbox = null;
+      inboxUnwatched(account.id);
       this.store.bumpState(account.id, "email");
       if (kind === "arrival") this.store.bumpState(account.id, "email_delivery");
       this.store.bumpState(account.id, "mailbox");

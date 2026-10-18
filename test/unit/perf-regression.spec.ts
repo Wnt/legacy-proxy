@@ -11,7 +11,7 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import { FakeImapServer, type CommandLog } from "../support/fake-imap.js";
 import { startHarness, type Harness } from "../support/harness.js";
-import { decodeMailboxId } from "../../src/mapping/ids.js";
+import { decodeEmailId, decodeMailboxId } from "../../src/mapping/ids.js";
 import { PushIdleManager } from "../../src/push/idle.js";
 
 // What Bulwark asks for when it opens a message (lib/jmap/client.ts getEmail).
@@ -316,5 +316,52 @@ describe("the pool reuses connections (no LOGIN per request)", () => {
     }
     expect(imap.count("LOGIN")).toBe(logins);
     expect(imap.connections).toBe(logins);
+  }, 30_000);
+});
+
+describe("an INBOX open the IDLE worker vouches for asks the server nothing (inbox-flags)", () => {
+  it("cached body and IDLE-tracked flags: no FETCH; a heard flag change shows; our own Email/set and a gap FETCH again", async () => {
+    const imap = new FakeImapServer();
+    for (let i = 0; i < 3; i++) imap.add("INBOX", { body: `Line one of ${i}\nLine two.` });
+    h = await startHarness(imap);
+    const mb = await h.mailboxIds();
+    const q = await h.call<{ ids: string[] }>("Email/query", { filter: { inMailbox: mb.INBOX }, position: 1, limit: 1 });
+    const id = q.ids[0]!;
+    const { uid, uidvalidity } = decodeEmailId(id);
+    // The instance the request path uses (a restart above reloads the modules).
+    const { __resetInboxFlags, inboxFlagsChanged, inboxGap, inboxListed, inboxUnwatched } = await import("../../src/push/inbox-flags.js");
+    // What the IDLE worker does once it has listed INBOX (push/idle.ts).
+    __resetInboxFlags();
+    inboxListed(h.account.id, uidvalidity, [1, 2, 3]);
+    const open = () => h!.call<{ list: { keywords: Record<string, boolean> }[] }>("Email/get", { ids: [id], properties: OPEN_PROPS, ...OPEN_OPTS });
+
+    await open(); // cold: body and flags from the server, flags kept
+    imap.reset();
+    const second = await open();
+    expect(imap.log.filter(isFetch)).toEqual([]);
+    expect(second.list[0]!.keywords).toEqual({});
+
+    // Another client marks it read; the worker hears it.
+    imap.setFlags("INBOX", uid, "+", ["\\Seen"]);
+    inboxFlagsChanged(h.account.id, uid, ["\\Seen"]);
+    imap.reset();
+    expect((await open()).list[0]!.keywords).toEqual({ $seen: true });
+    expect(imap.log.filter(isFetch)).toEqual([]);
+
+    // Our own write: the next open asks the server again.
+    await h.call("Email/set", { update: { [id]: { "keywords/$flagged": true } } });
+    imap.reset();
+    expect((await open()).list[0]!.keywords).toEqual({ $seen: true, $flagged: true });
+    expect(imap.log.filter(isFetch)).toHaveLength(1);
+
+    // A change nobody can name: asked again too.
+    imap.reset();
+    await open();
+    expect(imap.log.filter(isFetch)).toEqual([]);
+    inboxGap(h.account.id);
+    imap.reset();
+    await open();
+    expect(imap.log.filter(isFetch)).toHaveLength(1);
+    inboxUnwatched(h.account.id);
   }, 30_000);
 });

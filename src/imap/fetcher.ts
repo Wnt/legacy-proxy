@@ -22,6 +22,7 @@ import { BudgetExceededError, checkAborted } from "./abort.js";
 import type { AccountRow, MailboxRow, Store, EmailCacheUpsert } from "../state/store.js";
 import { log } from "../util/log.js";
 import { storeBodyCache, type BodyCache } from "./bodycache.js";
+import { inboxFlagsToken, knownInboxFlags, rememberInboxFlags } from "../push/inbox-flags.js";
 
 // The header fields threading and the default Email/get property set need:
 // References for threadId + `references`, In-Reply-To / Message-ID as backup.
@@ -843,6 +844,11 @@ async function fetchPreviewsBatched(
 // the hits, since flags are mutable), then batch previews and bodyValues
 // across the whole page. Returns a Map keyed by uid so callers can match
 // notFound by id.
+// INBOX is the folder the IDLE worker watches (push/idle.ts).
+function isInbox(mailbox: MailboxRow): boolean {
+  return typeof mailbox.name === "string" && mailbox.name.toUpperCase() === "INBOX";
+}
+
 export async function fetchEmailsBatch(
   client: ImapFlow,
   account: AccountRow,
@@ -919,6 +925,7 @@ export async function fetchEmailsBatch(
 
   if (missing.length > 0) {
     const fetchedMeta = new Map<number, FetchMessageObject>();
+    const metaToken = isInbox(mailbox) ? inboxFlagsToken(account.id) : 0;
     for await (const m of fetchByUid(client, missing, META_QUERY)) {
       // imapflow hands back every untagged FETCH that arrives during the
       // command, including the FLAGS-only ones a server pushes when another
@@ -958,16 +965,37 @@ export async function fetchEmailsBatch(
       raw.cachedThreadId = cachedRows.get(uid)?.thread_id ?? null;
       raws.set(uid, raw);
     }
+    if (isInbox(mailbox)) {
+      const read = new Map<number, Iterable<string>>();
+      for (const [uid, m] of fetchedMeta) if (m.flags) read.set(uid, m.flags);
+      rememberInboxFlags(account.id, mailbox.uidvalidity, read, metaToken);
+    }
   }
 
-  // Flags for cache-served messages: one flags-only FETCH for the whole set.
+  // Flags for cache-served messages: INBOX ones the IDLE worker vouches for
+  // (push/inbox-flags.ts), then one flags-only FETCH for the rest.
+  const inbox = isInbox(mailbox);
+  if (inbox) {
+    for (const uid of uids) {
+      const r = raws.get(uid);
+      if (r?.flags !== null) continue;
+      const known = knownInboxFlags(account.id, mailbox.uidvalidity, uid);
+      if (known) r.flags = new Set(known);
+    }
+  }
   const flagUids = uids.filter((uid) => raws.get(uid)?.flags === null);
   if (flagUids.length > 0) {
+    const token = inbox ? inboxFlagsToken(account.id) : 0;
+    const read = new Map<number, Set<string>>();
     for await (const m of fetchByUid(client, flagUids, { uid: true, flags: true })) {
       if (m.uid == null) continue;
       const r = raws.get(m.uid);
-      if (r) r.flags = new Set(m.flags ?? []);
+      if (r) {
+        r.flags = new Set(m.flags ?? []);
+        read.set(m.uid, r.flags);
+      }
     }
+    if (inbox) rememberInboxFlags(account.id, mailbox.uidvalidity, read, token);
   }
 
   const processed: ProcessedMeta[] = [];

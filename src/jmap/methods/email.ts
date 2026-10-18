@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { inboxGap } from "../../push/inbox-flags.js";
 import type { FetchQueryObject, ImapFlow } from "imapflow";
 import type { AccountRow, Store, EmailCacheUpsert } from "../../state/store.js";
 import { BULK_CONNECTIONS, viewEmailState, type ImapPool } from "../../imap/pool.js";
@@ -1751,7 +1752,22 @@ export interface EmailSetResponse {
   notDestroyed: Record<string, SetError> | null;
 }
 
+// INBOX flags the IDLE worker vouches for (push/inbox-flags.ts) are void while
+// and after this proxy writes: the worker's echo of the write may arrive after
+// the client asks again, and must not be answered from before the write.
 export async function emailSet(
+  args: EmailSetArgs,
+  ctx: MailCtx,
+): Promise<EmailSetResponse> {
+  inboxGap(ctx.account.id);
+  try {
+    return await emailSetUnguarded(args, ctx);
+  } finally {
+    inboxGap(ctx.account.id);
+  }
+}
+
+async function emailSetUnguarded(
   args: EmailSetArgs,
   ctx: MailCtx,
 ): Promise<EmailSetResponse> {
