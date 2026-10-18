@@ -11,7 +11,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { FakeImapServer } from "../support/fake-imap.js";
 import { startHarness, type Harness } from "../support/harness.js";
-import { textSearchWindows } from "../../src/jmap/methods/email.js";
+import { inflightSearchCount, textSearchWindows, uidRanges } from "../../src/jmap/methods/email.js";
 
 let h: Harness | null = null;
 afterEach(async () => {
@@ -235,4 +235,30 @@ describe("a full-text search of a large folder runs in UID slices, in parallel",
     // folder is searched in one go on the request's own connection.
     expect(sliceSearches(imap).length >= 2).toBe(sliced);
   }, 60_000);
+
+  it("a second identical search while the first runs reads no message twice", async () => {
+    // A client that gave up (a proxy's request limit) asks again while the
+    // first search still runs: it waits for that one.
+    const { imap, mb } = await bigInbox();
+    const filter = { operator: "AND", conditions: [{ text: "zorblatt" }, { inMailboxOtherThan: [mb.Trash, mb.Junk] }] };
+    const sort = [{ property: "receivedAt", isAscending: false }];
+    imap.reset();
+    const [a, b] = await Promise.all([
+      h!.call<Query>("Email/query", { filter, sort, limit: 50 }),
+      h!.call<Query>("Email/query", { filter, sort, limit: 50 }),
+    ]);
+    expect(a.ids).toHaveLength(3);
+    expect(b.ids).toEqual(a.ids);
+    const twice = searches(imap).map((l) => `${l.folder} ${l.line.replace(/^\S+ /, "")}`);
+    expect(new Set(twice).size).toBe(twice.length);
+    expect(inflightSearchCount()).toBe(0);
+  }, 60_000);
+});
+
+describe("uidRanges", () => {
+  it("covers every UID once, the last range open-ended", () => {
+    expect(uidRanges(11, 4)).toEqual(["1:3", "4:6", "7:9", "10:*"]);
+    expect(uidRanges(6, 4)).toEqual(["1:2", "3:4", "5:*"]);
+    expect(uidRanges(2, 3)).toEqual(["1:*"]);
+  });
 });

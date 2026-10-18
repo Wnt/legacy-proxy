@@ -506,9 +506,8 @@ async function searchUidsInSlices(
   const n = Math.min(SLICE_MAX, Math.ceil(messages / SLICE_MIN_MESSAGES));
   if (n < 2) return null;
   const ranges = uidRanges(uidNext, n);
-  let parts: number[][];
-  try {
-    parts = await mapWithConcurrency(ranges, n, (range) =>
+  const run = async (): Promise<number[]> => {
+    const parts = await mapWithConcurrency(ranges, n, (range) =>
       pool.withConnection(ctx.account, "bulk", (client) =>
         withMailbox(client, path, async () => {
           if (!isCurrentEpoch(client, uidvalidity)) throw new Error("UIDVALIDITY changed during the search");
@@ -517,15 +516,42 @@ async function searchUidsInSlices(
         }),
       ),
     );
+    const all = new Set<number>();
+    for (const p of parts) for (const uid of p) all.add(uid);
+    return [...all].sort((a, b) => a - b);
+  };
+  try {
+    return await sharedSearch(`${searchKey(ctx.account.id, path, uidvalidity, query)}|slices:${n}`, run);
   } catch (e) {
     // No bulk connection to be had (or the folder changed under us): the
     // caller searches the folder in one go instead.
     log.warn({ mailbox: path, err: (e as Error).message }, "sliced search failed; searching in one go");
     return null;
   }
-  const all = new Set<number>();
-  for (const p of parts) for (const uid of p) all.add(uid);
-  return [...all].sort((a, b) => a - b);
+}
+
+// One full-text SEARCH per account, folder, UIDVALIDITY and query at a time.
+// A search keeps running when its client gives up (a proxy's request limit),
+// and filing its result is what lets the client's next try finish quickly; a
+// try that arrives while it still runs waits for it instead of reading every
+// message a second time, competing with it for the same connections.
+const inflightSearches = new Map<string, Promise<number[]>>();
+
+function searchKey(accountId: number, path: string, uidvalidity: number, query: ImapSearch): string {
+  return `${accountId}|${path}|${uidvalidity}|${stableHash(query)}`;
+}
+
+function sharedSearch(key: string, run: () => Promise<number[]>): Promise<number[]> {
+  const running = inflightSearches.get(key);
+  if (running) return running;
+  const p = run().finally(() => inflightSearches.delete(key));
+  inflightSearches.set(key, p);
+  return p;
+}
+
+/** In-flight full-text SEARCHes (tests). */
+export function inflightSearchCount(): number {
+  return inflightSearches.size;
 }
 
 /** `n` UID ranges that together cover 1:* (the last one is open-ended). */
@@ -800,8 +826,13 @@ async function emailQuerySingleMailboxFull(
       if (sliced) {
         uids = sliced;
       } else {
-        const searchResult = await ctx.client.search(query, { uid: true });
-        uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
+        const search = async () => {
+          const r = await ctx.client.search(query, { uid: true });
+          return Array.isArray(r) ? (r as number[]) : [];
+        };
+        uids = hasFullTextTerm(filter)
+          ? await sharedSearch(searchKey(ctx.account.id, mboxRow.name, uidvalidity, query), search)
+          : await search();
       }
       searchCache.set(cacheKey, {
         uids,
@@ -1105,8 +1136,12 @@ async function emailQueryAccountWideFull(
         if (prev && sameFolderStatus(prev, live)) uids = prev.uids;
       }
       if (!uids) {
-        const searchResult = await client.search(windowedSearch(imapFilter, window), { uid: true });
-        uids = Array.isArray(searchResult) ? (searchResult as number[]) : [];
+        const query = windowedSearch(imapFilter, window);
+        const search = async () => {
+          const r = await client.search(query, { uid: true });
+          return Array.isArray(r) ? (r as number[]) : [];
+        };
+        uids = fullText ? await sharedSearch(searchKey(ctx.account.id, row.name, uidvalidity, query), search) : await search();
         searchCache.set(cacheKey, {
           uids,
           modseq,
